@@ -1,5 +1,5 @@
 name: "Build & Push to Registry"
-description: "Build a Docker image and push it to any container registry as {image}-{suffix}:YYYY-MM-DD.shortsha. Defaults to GitHub Container Registry with the current repository when no credentials are passed."
+description: "Build and push Docker images to any container registry with tags, cache, build args, and multi-arch support."
 author: "RelyBytes"
 
 branding:
