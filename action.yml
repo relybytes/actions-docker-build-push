@@ -1,0 +1,544 @@
+name: "Build & Push to Registry"
+description: "Build a Docker image and push it to any container registry as {image}-{suffix}:YYYY-MM-DD.shortsha. Defaults to GitHub Container Registry with the current repository when no credentials are passed."
+author: "RelyBytes"
+
+branding:
+  icon: "package"
+  color: "blue"
+
+inputs:
+  registry:
+    description: "Container registry host, for example ghcr.io, docker.io, registry.example.com. Defaults to ghcr.io."
+    required: false
+    default: "ghcr.io"
+
+  username:
+    description: "Registry username. Defaults to the GitHub actor, works with ghcr.io."
+    required: false
+    default: "${{ github.actor }}"
+
+  password:
+    description: "Registry password or access token. Defaults to GITHUB_TOKEN, works with ghcr.io when packages: write is granted."
+    required: false
+    default: "${{ github.token }}"
+
+  image_name:
+    description: "Base image name without tag. Defaults to the current repository, lowercased. The environment suffix is appended to it."
+    required: false
+    default: ""
+
+  dockerfile:
+    description: "Path to the Dockerfile. Can be relative to the repository root or to the build context."
+    required: false
+    default: "Dockerfile"
+
+  context:
+    description: "Build context directory."
+    required: false
+    default: "."
+
+  suffix:
+    description: "Image-name suffix override, appended as '-{suffix}'. If empty, derived from the branch. Pass 'none' to disable the suffix."
+    required: false
+    default: ""
+
+  version:
+    description: "Override the tag, the part after ':'. If empty, 'YYYY-MM-DD.shortsha' is generated."
+    required: false
+    default: ""
+
+  platforms:
+    description: "Target platforms."
+    required: false
+    default: "linux/amd64"
+
+  build_args:
+    description: "Newline-separated build arguments, KEY=VALUE."
+    required: false
+    default: ""
+
+  target:
+    description: "Target build stage for multi-stage Dockerfiles."
+    required: false
+    default: ""
+
+  labels:
+    description: "Newline-separated OCI labels, KEY=VALUE. Auto-generated when empty."
+    required: false
+    default: ""
+
+  push:
+    description: "Push the image to the registry."
+    required: false
+    default: "true"
+
+  push_on_pr:
+    description: "Allow pushing images on pull request events. Disabled by default for safety."
+    required: false
+    default: "false"
+
+  additional_tags:
+    description: "Comma-separated additional tags to publish on the same image."
+    required: false
+    default: ""
+
+  latest:
+    description: "Also publish the ':latest' tag on the suffixed image. 'auto' enables it on main/master non-PR builds only."
+    required: false
+    default: "auto"
+
+  cache:
+    description: "Enable BuildKit inline cache."
+    required: false
+    default: "true"
+
+  no_cache:
+    description: "Disable build cache entirely."
+    required: false
+    default: "false"
+
+outputs:
+  image:
+    description: "Full image reference, registry/name-suffix:version."
+    value: ${{ steps.build.outputs.image }}
+
+  image_repository:
+    description: "Image repository portion, registry/name-suffix."
+    value: ${{ steps.resolve.outputs.image_repository }}
+
+  version:
+    description: "Resolved tag, YYYY-MM-DD.shortsha or override."
+    value: ${{ steps.resolve.outputs.version }}
+
+  suffix:
+    description: "Resolved environment suffix."
+    value: ${{ steps.resolve.outputs.suffix }}
+
+  branch:
+    description: "Branch used to derive the suffix."
+    value: ${{ steps.resolve.outputs.branch }}
+
+  tags:
+    description: "All tags applied, newline-separated."
+    value: ${{ steps.build.outputs.tags }}
+
+  digest:
+    description: "Image digest after push, when available."
+    value: ${{ steps.build.outputs.digest }}
+
+  build_time:
+    description: "UTC timestamp of the build."
+    value: ${{ steps.build.outputs.build_time }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Resolve image, version and push policy
+      id: resolve
+      shell: bash
+      env:
+        INPUT_SUFFIX: ${{ inputs.suffix }}
+        INPUT_VERSION: ${{ inputs.version }}
+        INPUT_IMAGE_NAME: ${{ inputs.image_name }}
+        INPUT_LATEST: ${{ inputs.latest }}
+        INPUT_PUSH: ${{ inputs.push }}
+        INPUT_PUSH_ON_PR: ${{ inputs.push_on_pr }}
+        REGISTRY: ${{ inputs.registry }}
+        REPO: ${{ github.repository }}
+        REF_NAME: ${{ github.ref_name }}
+        REF_TYPE: ${{ github.ref_type }}
+        EVENT_NAME: ${{ github.event_name }}
+        HEAD_REF: ${{ github.head_ref }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        SHA: ${{ github.sha }}
+      run: |
+        set -euo pipefail
+
+        echo "::group::Resolving image, version and push policy"
+
+        sanitize_repository_path() {
+          echo "$1" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed 's#[^a-z0-9._/-]#-#g' \
+            | sed 's#//*#/#g' \
+            | sed 's#^/*##' \
+            | sed 's#/*$##'
+        }
+
+        sanitize_suffix() {
+          echo "$1" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed 's#[^a-z0-9._-]#-#g' \
+            | sed 's#^-*##' \
+            | sed 's#-*$##'
+        }
+
+        sanitize_tag() {
+          local tag
+          tag="$(echo "$1" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed 's#[^a-z0-9._-]#-#g' \
+            | sed 's#^-*##' \
+            | cut -c1-128)"
+
+          if [[ -z "$tag" ]]; then
+            echo "::error::Resolved Docker tag is empty after sanitization"
+            exit 1
+          fi
+
+          echo "$tag"
+        }
+
+        if [[ -z "$INPUT_IMAGE_NAME" ]]; then
+          BASE_NAME="$(sanitize_repository_path "$REPO")"
+        else
+          BASE_NAME="$(sanitize_repository_path "$INPUT_IMAGE_NAME")"
+        fi
+
+        if [[ -z "$BASE_NAME" ]]; then
+          echo "::error::Image name is empty after sanitization"
+          exit 1
+        fi
+
+        if [[ "$EVENT_NAME" == "pull_request" ]] || [[ "$EVENT_NAME" == "pull_request_target" ]]; then
+          BRANCH="$HEAD_REF"
+        else
+          BRANCH="$REF_NAME"
+        fi
+
+        if [[ -z "$BRANCH" ]]; then
+          BRANCH="unknown"
+        fi
+
+        if [[ "$INPUT_SUFFIX" == "none" ]]; then
+          SUFFIX=""
+        elif [[ -n "$INPUT_SUFFIX" ]]; then
+          SUFFIX="$(sanitize_suffix "$INPUT_SUFFIX")"
+        elif [[ "$EVENT_NAME" == "pull_request" ]] || [[ "$EVENT_NAME" == "pull_request_target" ]]; then
+          SUFFIX="pr-${PR_NUMBER:-unknown}"
+          SUFFIX="$(sanitize_suffix "$SUFFIX")"
+        elif [[ "$REF_TYPE" == "tag" ]]; then
+          SUFFIX="release"
+        else
+          case "$BRANCH" in
+            main|master)
+              SUFFIX="prod"
+              ;;
+            develop|dev)
+              SUFFIX="dev"
+              ;;
+            staging)
+              SUFFIX="staging"
+              ;;
+            release/*)
+              SUFFIX="rc"
+              ;;
+            hotfix/*)
+              SUFFIX="hotfix"
+              ;;
+            feature/*)
+              SUFFIX="feat"
+              ;;
+            *)
+              SUFFIX="$(sanitize_suffix "$BRANCH")"
+              ;;
+          esac
+        fi
+
+        if [[ -n "$SUFFIX" ]]; then
+          IMAGE_NAME="${BASE_NAME}-${SUFFIX}"
+        else
+          IMAGE_NAME="$BASE_NAME"
+        fi
+
+        IMAGE_REPOSITORY="${REGISTRY}/${IMAGE_NAME}"
+
+        if [[ -n "$INPUT_VERSION" ]]; then
+          VERSION="$(sanitize_tag "$INPUT_VERSION")"
+        else
+          DATE="$(date -u +%Y-%m-%d)"
+          SHORT_SHA="${SHA:0:7}"
+          VERSION="$(sanitize_tag "${DATE}.${SHORT_SHA}")"
+        fi
+
+        case "$INPUT_LATEST" in
+          true)
+            LATEST_ENABLED="true"
+            ;;
+          false)
+            LATEST_ENABLED="false"
+            ;;
+          *)
+            if [[ "$EVENT_NAME" != "pull_request" ]] \
+              && [[ "$EVENT_NAME" != "pull_request_target" ]] \
+              && [[ "$BRANCH" =~ ^(main|master)$ ]]; then
+              LATEST_ENABLED="true"
+            else
+              LATEST_ENABLED="false"
+            fi
+            ;;
+        esac
+
+        EFFECTIVE_PUSH="$INPUT_PUSH"
+
+        if [[ "$EFFECTIVE_PUSH" == "true" ]] \
+          && [[ "$EVENT_NAME" == "pull_request" || "$EVENT_NAME" == "pull_request_target" ]] \
+          && [[ "$INPUT_PUSH_ON_PR" != "true" ]]; then
+          echo "::warning::Push disabled on pull request events. Set push_on_pr=true to override."
+          EFFECTIVE_PUSH="false"
+        fi
+
+        echo "Registry:        $REGISTRY"
+        echo "Base name:       $BASE_NAME"
+        echo "Suffix:          ${SUFFIX:-<none>}"
+        echo "Image name:      $IMAGE_NAME"
+        echo "Image repo:      $IMAGE_REPOSITORY"
+        echo "Branch / event:  $BRANCH / $EVENT_NAME"
+        echo "Version tag:     $VERSION"
+        echo "Latest tag:      $LATEST_ENABLED"
+        echo "Push enabled:    $EFFECTIVE_PUSH"
+
+        echo "base_name=$BASE_NAME" >> "$GITHUB_OUTPUT"
+        echo "image_name=$IMAGE_NAME" >> "$GITHUB_OUTPUT"
+        echo "image_repository=$IMAGE_REPOSITORY" >> "$GITHUB_OUTPUT"
+        echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+        echo "suffix=$SUFFIX" >> "$GITHUB_OUTPUT"
+        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+        echo "latest_enabled=$LATEST_ENABLED" >> "$GITHUB_OUTPUT"
+        echo "push=$EFFECTIVE_PUSH" >> "$GITHUB_OUTPUT"
+
+        echo "::endgroup::"
+
+    - name: Validate context
+      id: validate
+      shell: bash
+      env:
+        INPUT_CONTEXT: ${{ inputs.context }}
+        INPUT_DOCKERFILE: ${{ inputs.dockerfile }}
+        PLATFORMS: ${{ inputs.platforms }}
+        PUSH: ${{ steps.resolve.outputs.push }}
+      run: |
+        set -euo pipefail
+
+        echo "::group::Validating build context"
+
+        if [[ ! -d "$INPUT_CONTEXT" ]]; then
+          echo "::error::Build context '$INPUT_CONTEXT' does not exist"
+          exit 1
+        fi
+
+        if [[ -f "$INPUT_CONTEXT/$INPUT_DOCKERFILE" ]]; then
+          DOCKERFILE_PATH="$INPUT_CONTEXT/$INPUT_DOCKERFILE"
+        elif [[ -f "$INPUT_DOCKERFILE" ]]; then
+          DOCKERFILE_PATH="$INPUT_DOCKERFILE"
+        else
+          echo "::error::Dockerfile not found at '$INPUT_DOCKERFILE' or '$INPUT_CONTEXT/$INPUT_DOCKERFILE'"
+          exit 1
+        fi
+
+        if [[ "$PUSH" != "true" && "$PLATFORMS" == *","* ]]; then
+          echo "::error::push=false supports only a single platform because --load cannot load a multi-platform image locally"
+          exit 1
+        fi
+
+        echo "Context:         $INPUT_CONTEXT"
+        echo "Dockerfile:      $DOCKERFILE_PATH"
+        echo "Platforms:       $PLATFORMS"
+
+        echo "dockerfile_path=$DOCKERFILE_PATH" >> "$GITHUB_OUTPUT"
+
+        echo "::endgroup::"
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Login to registry
+      if: steps.resolve.outputs.push == 'true'
+      shell: bash
+      env:
+        REG_USER: ${{ inputs.username }}
+        REG_PASS: ${{ inputs.password }}
+        REG_HOST: ${{ inputs.registry }}
+      run: |
+        set -euo pipefail
+
+        echo "::group::Authenticating to $REG_HOST"
+
+        if [[ -z "$REG_USER" ]]; then
+          echo "::error::Registry username is empty"
+          exit 1
+        fi
+
+        if [[ -z "$REG_PASS" ]]; then
+          echo "::error::Registry password is empty. Pass 'password' or grant 'packages: write' for the default GITHUB_TOKEN on ghcr.io."
+          exit 1
+        fi
+
+        echo "$REG_PASS" | docker login "$REG_HOST" --username "$REG_USER" --password-stdin
+
+        echo "::endgroup::"
+
+    - name: Build and push
+      id: build
+      shell: bash
+      env:
+        IMAGE_REPOSITORY: ${{ steps.resolve.outputs.image_repository }}
+        VERSION: ${{ steps.resolve.outputs.version }}
+        LATEST_ENABLED: ${{ steps.resolve.outputs.latest_enabled }}
+        REF_TYPE: ${{ github.ref_type }}
+        REF_NAME: ${{ github.ref_name }}
+        SHA: ${{ github.sha }}
+        DOCKERFILE_PATH: ${{ steps.validate.outputs.dockerfile_path }}
+        BUILD_CONTEXT: ${{ inputs.context }}
+        BUILD_ARGS: ${{ inputs.build_args }}
+        BUILD_TARGET: ${{ inputs.target }}
+        PLATFORMS: ${{ inputs.platforms }}
+        PUSH: ${{ steps.resolve.outputs.push }}
+        CACHE: ${{ inputs.cache }}
+        NO_CACHE: ${{ inputs.no_cache }}
+        LABELS: ${{ inputs.labels }}
+        ADDITIONAL_TAGS: ${{ inputs.additional_tags }}
+        SERVER_URL: ${{ github.server_url }}
+        REPO: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+
+        echo "::group::Building $IMAGE_REPOSITORY:$VERSION"
+
+        sanitize_tag() {
+          local tag
+          tag="$(echo "$1" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed 's#[^a-z0-9._-]#-#g' \
+            | sed 's#^-*##' \
+            | cut -c1-128)"
+
+          if [[ -z "$tag" ]]; then
+            echo "::error::Resolved Docker tag is empty after sanitization"
+            exit 1
+          fi
+
+          echo "$tag"
+        }
+
+        BUILD_START=$(date +%s)
+        BUILD_TIME="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+        FULL_IMAGE="${IMAGE_REPOSITORY}:${VERSION}"
+
+        TAGS=("$FULL_IMAGE")
+
+        if [[ "$LATEST_ENABLED" == "true" ]]; then
+          TAGS+=("${IMAGE_REPOSITORY}:latest")
+        fi
+
+        if [[ "$REF_TYPE" == "tag" ]]; then
+          TAGS+=("${IMAGE_REPOSITORY}:$(sanitize_tag "$REF_NAME")")
+        fi
+
+        if [[ -n "$ADDITIONAL_TAGS" ]]; then
+          IFS=',' read -ra EXTRA <<< "$ADDITIONAL_TAGS"
+          for t in "${EXTRA[@]}"; do
+            t="$(echo "$t" | xargs)"
+            [[ -z "$t" ]] && continue
+            t="$(sanitize_tag "$t")"
+            TAGS+=("${IMAGE_REPOSITORY}:${t}")
+          done
+        fi
+
+        TAG_ARGS=()
+        for t in "${TAGS[@]}"; do
+          TAG_ARGS+=("--tag" "$t")
+          echo "Tag: $t"
+        done
+
+        BUILD_ARG_OPTS=()
+        if [[ -n "$BUILD_ARGS" ]]; then
+          while IFS= read -r line; do
+            line="$(echo "$line" | xargs)"
+            [[ -z "$line" ]] && continue
+            BUILD_ARG_OPTS+=("--build-arg" "$line")
+          done <<< "$BUILD_ARGS"
+        fi
+
+        LABEL_OPTS=()
+        if [[ -n "$LABELS" ]]; then
+          while IFS= read -r line; do
+            line="$(echo "$line" | xargs)"
+            [[ -z "$line" ]] && continue
+            LABEL_OPTS+=("--label" "$line")
+          done <<< "$LABELS"
+        else
+          LABEL_OPTS+=(
+            "--label" "org.opencontainers.image.source=${SERVER_URL}/${REPO}"
+            "--label" "org.opencontainers.image.revision=${SHA}"
+            "--label" "org.opencontainers.image.created=${BUILD_TIME}"
+            "--label" "org.opencontainers.image.version=${VERSION}"
+          )
+        fi
+
+        EXTRA_OPTS=()
+
+        if [[ -n "$BUILD_TARGET" ]]; then
+          EXTRA_OPTS+=("--target" "$BUILD_TARGET")
+        fi
+
+        if [[ "$NO_CACHE" == "true" ]]; then
+          EXTRA_OPTS+=("--no-cache")
+        fi
+
+        if [[ "$CACHE" == "true" ]]; then
+          EXTRA_OPTS+=("--build-arg" "BUILDKIT_INLINE_CACHE=1")
+        fi
+
+        if [[ "$PUSH" == "true" ]]; then
+          EXTRA_OPTS+=("--push")
+        else
+          EXTRA_OPTS+=("--load")
+        fi
+
+        docker buildx build \
+          --platform "$PLATFORMS" \
+          --file "$DOCKERFILE_PATH" \
+          "${TAG_ARGS[@]}" \
+          "${BUILD_ARG_OPTS[@]}" \
+          "${LABEL_OPTS[@]}" \
+          "${EXTRA_OPTS[@]}" \
+          "$BUILD_CONTEXT"
+
+        BUILD_END=$(date +%s)
+        BUILD_DURATION=$((BUILD_END - BUILD_START))
+
+        echo "Build completed in ${BUILD_DURATION}s"
+
+        DIGEST=""
+        if [[ "$PUSH" == "true" ]]; then
+          DIGEST="$(docker buildx imagetools inspect "$FULL_IMAGE" --format '{{json .Manifest.Digest}}' 2>/dev/null | tr -d '"' || true)"
+          if [[ -n "$DIGEST" ]]; then
+            echo "Digest: $DIGEST"
+          else
+            echo "Digest: unavailable"
+          fi
+        fi
+
+        echo "image=$FULL_IMAGE" >> "$GITHUB_OUTPUT"
+
+        {
+          echo "tags<<EOF"
+          printf '%s\n' "${TAGS[@]}"
+          echo "EOF"
+        } >> "$GITHUB_OUTPUT"
+
+        echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+        echo "build_time=$BUILD_TIME" >> "$GITHUB_OUTPUT"
+
+        echo "::endgroup::"
+
+    - name: Cleanup
+      if: always()
+      shell: bash
+      env:
+        REG_HOST: ${{ inputs.registry }}
+      run: |
+        echo "::group::Cleanup"
+        docker logout "$REG_HOST" >/dev/null 2>&1 || true
+        echo "::endgroup::"

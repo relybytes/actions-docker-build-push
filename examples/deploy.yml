@@ -1,0 +1,26 @@
+name: Deploy to Kubernetes
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Deploy to Kubernetes
+        uses: relybytes/actions-kubernetes-deploy@v1
+        with:
+          kubeconfig: ${{ secrets.KUBECONFIG }}
+          namespace: production
+          manifests: ./k8s
+          replacements: |
+            __IMAGE__=ghcr.io/myorg/api:${{ github.sha }}
+            __APP_ENV__=production
+          wait: "true"
+          wait_timeout: "300s"
