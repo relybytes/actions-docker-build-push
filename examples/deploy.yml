@@ -1,9 +1,13 @@
-name: Deploy to Kubernetes
+name: Build and Deploy to Kubernetes
 
 on:
   push:
     branches:
       - main
+
+permissions:
+  contents: read
+  packages: write
 
 jobs:
   deploy:
@@ -13,6 +17,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Build and push Docker image
+        id: image
+        uses: relybytes/actions-docker-build-push@v1
+        with:
+          registry: ghcr.io
+          image_name: myorg/api
+          suffix: none
+
       - name: Deploy to Kubernetes
         uses: relybytes/actions-kubernetes-deploy@v1
         with:
@@ -20,7 +32,7 @@ jobs:
           namespace: production
           manifests: ./k8s
           replacements: |
-            __IMAGE__=ghcr.io/myorg/api:${{ github.sha }}
+            __IMAGE__=${{ steps.image.outputs.image }}
             __APP_ENV__=production
           wait: "true"
           wait_timeout: "300s"
