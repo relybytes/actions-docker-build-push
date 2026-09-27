@@ -133,6 +133,43 @@ outputs:
 runs:
   using: "composite"
   steps:
+    - name: Prepare an isolated Docker configuration
+      id: prepare
+      shell: bash
+      env:
+        REG_PASS: ${{ inputs.password }}
+      run: |
+        set -euo pipefail
+
+        echo "::group::Preparing an isolated Docker configuration"
+
+        # The runner masks the secrets it handed out itself, but a caller that
+        # derives the password from a previous step output, which is how ECR
+        # works, gets no masking at all. Mask it before any step can echo it.
+        if [[ -n "$REG_PASS" ]]; then
+          echo "::add-mask::$REG_PASS"
+        fi
+
+        # Self-hosted runners execute jobs from different repositories as the
+        # same user, so ~/.docker/config.json is shared mutable state: logging
+        # in writes a credential every concurrent job can read, and logging out
+        # deletes the credential another job may be using mid-push. Give this
+        # run its own DOCKER_CONFIG, with a unique name, mode 700, under the
+        # per-job temp directory that the runner wipes between jobs. Buildx
+        # keeps its builder metadata there too, so the current-builder marker
+        # stops being shared as well.
+        CONFIG_DIR="$(mktemp -d "${RUNNER_TEMP:-/tmp}/docker-config-XXXXXXXXXX")"
+        chmod 700 "$CONFIG_DIR"
+
+        echo "DOCKER_CONFIG=$CONFIG_DIR" >>"$GITHUB_ENV"
+
+        echo "docker_config=$CONFIG_DIR" >>"$GITHUB_OUTPUT"
+        echo "docker_config_previous=${DOCKER_CONFIG:-}" >>"$GITHUB_OUTPUT"
+
+        echo "Docker config:   $CONFIG_DIR"
+
+        echo "::endgroup::"
+
     - name: Resolve image, version and push policy
       id: resolve
       shell: bash
@@ -350,6 +387,7 @@ runs:
         echo "::endgroup::"
 
     - name: Set up Docker Buildx
+      id: buildx
       uses: docker/setup-buildx-action@v4
 
     - name: Login to registry
@@ -374,6 +412,9 @@ runs:
           exit 1
         fi
 
+        # The credential lands in $DOCKER_CONFIG/config.json, the directory this
+        # run created for itself in the prepare step, not in the shared
+        # ~/.docker that every concurrent job can read.
         echo "$REG_PASS" | docker login "$REG_HOST" --username "$REG_USER" --password-stdin
 
         echo "::endgroup::"
@@ -382,6 +423,7 @@ runs:
       id: build
       shell: bash
       env:
+        BUILDER: ${{ steps.buildx.outputs.name }}
         IMAGE_REPOSITORY: ${{ steps.resolve.outputs.image_repository }}
         VERSION: ${{ steps.resolve.outputs.version }}
         LATEST_ENABLED: ${{ steps.resolve.outputs.latest_enabled }}
@@ -451,12 +493,26 @@ runs:
           echo "Tag: $t"
         done
 
+        # Build args are passed by key only. '--build-arg KEY=VALUE' puts the
+        # value in argv, where any other job on the runner can read it with ps;
+        # '--build-arg KEY' makes buildx take the value from the environment.
         BUILD_ARG_OPTS=()
         if [[ -n "$BUILD_ARGS" ]]; then
           while IFS= read -r line; do
             line="$(echo "$line" | xargs)"
             [[ -z "$line" ]] && continue
-            BUILD_ARG_OPTS+=("--build-arg" "$line")
+            if [[ "$line" != *"="* ]]; then
+              echo "::error::build_args entry '$line' is not KEY=VALUE"
+              exit 1
+            fi
+            arg_key="${line%%=*}"
+            arg_value="${line#*=}"
+            if [[ ! "$arg_key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+              echo "::error::build_args key '$arg_key' is not a valid environment variable name"
+              exit 1
+            fi
+            export "${arg_key}=${arg_value}"
+            BUILD_ARG_OPTS+=("--build-arg" "$arg_key")
           done <<< "$BUILD_ARGS"
         fi
 
@@ -496,7 +552,12 @@ runs:
           EXTRA_OPTS+=("--load")
         fi
 
+        # Always name the builder. Without --builder, buildx reads the global
+        # current-builder marker, which on a self-hosted runner is shared state:
+        # another job's setup-buildx-action moves it, this build then runs inside
+        # that job's buildkit container, and dies when its post step removes it.
         docker buildx build \
+          --builder "$BUILDER" \
           --platform "$PLATFORMS" \
           --file "$DOCKERFILE_PATH" \
           "${TAG_ARGS[@]}" \
@@ -512,7 +573,7 @@ runs:
 
         DIGEST=""
         if [[ "$PUSH" == "true" ]]; then
-          DIGEST="$(docker buildx imagetools inspect "$FULL_IMAGE" --format '{{json .Manifest.Digest}}' 2>/dev/null | tr -d '"' || true)"
+          DIGEST="$(docker buildx --builder "$BUILDER" imagetools inspect "$FULL_IMAGE" --format '{{json .Manifest.Digest}}' 2>/dev/null | tr -d '"' || true)"
           if [[ -n "$DIGEST" ]]; then
             echo "Digest: $DIGEST"
           else
@@ -534,11 +595,39 @@ runs:
         echo "::endgroup::"
 
     - name: Cleanup
+      id: cleanup
       if: always()
       shell: bash
       env:
-        REG_HOST: ${{ inputs.registry }}
+        BUILDER: ${{ steps.buildx.outputs.name }}
+        CONFIG_DIR: ${{ steps.prepare.outputs.docker_config }}
+        CONFIG_DIR_PREVIOUS: ${{ steps.prepare.outputs.docker_config_previous }}
       run: |
+        set -uo pipefail
+
         echo "::group::Cleanup"
-        docker logout "$REG_HOST" >/dev/null 2>&1 || true
+
+        # No global 'docker logout' here. The old one had no condition, so a
+        # build that never logged in still rewrote the shared
+        # ~/.docker/config.json and could delete the credential another
+        # repository's job was using mid-push. Removing this run's own
+        # DOCKER_CONFIG directory takes the credential off disk and touches
+        # nothing shared.
+        if [[ -n "$CONFIG_DIR" && -d "$CONFIG_DIR" ]]; then
+          # Remove the builder first: it is registered inside the directory
+          # about to be deleted, so tearing it down afterwards would leave a
+          # stray buildkit container running on the host.
+          if [[ -n "$BUILDER" ]]; then
+            docker buildx --builder "$BUILDER" rm --force >/dev/null 2>&1 || true
+          fi
+
+          rm -rf -- "$CONFIG_DIR"
+          echo "Removed the Docker configuration directory of this run"
+        fi
+
+        # Restore whatever DOCKER_CONFIG the job had before, so later steps in
+        # the caller's job do not point at a directory that no longer exists.
+        # An empty value makes the Docker CLI fall back to its own default.
+        echo "DOCKER_CONFIG=$CONFIG_DIR_PREVIOUS" >>"$GITHUB_ENV"
+
         echo "::endgroup::"
