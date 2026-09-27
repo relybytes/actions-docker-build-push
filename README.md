@@ -14,11 +14,15 @@ The environment marker is appended as a **suffix on the image repository**, not 
 
 The `suffix` is automatically derived from the current Git ref, branch, tag, or pull request, and can be overridden together with `image_name`, `version`, registry credentials, and other build options.
 
+The action is designed to run unchanged on GitHub-hosted runners and on persistent self-hosted runners shared by several repositories. See [Runner requirements](#runner-requirements) and [Behaviour on shared runners](#behaviour-on-shared-runners).
+
 ## Naming convention
 
 - **Image repository**: `{base_name}-{suffix}`, for example `relybytes/myapp-prod`
-- **Tag**: `YYYY-MM-DD.shortsha`, using UTC date and the first 7 characters of `github.sha`
+- **Tag**: `YYYY-MM-DD.shortsha`, using the UTC date and the first 7 characters of the commit being built
 - **Full image**: `{registry}/{base_name}-{suffix}:{tag}`
+
+The commit in the tag is `github.sha` on every event except pull requests. On `pull_request` and `pull_request_target` it is `github.event.pull_request.head.sha`, the head commit of the pull request, because `github.sha` there is an ephemeral merge commit that does not exist in the repository and could never be checked out again. The same commit is used for the `org.opencontainers.image.revision` label.
 
 Examples:
 
@@ -50,7 +54,7 @@ Example:
 suffix: canary
 ```
 
-Pass `suffix: none` to disable the suffix entirely.
+Pass `suffix: none` to disable the suffix entirely. The comparison is case-insensitive and ignores surrounding whitespace, so `None` and `" none "` work too.
 
 ## Extra tags published automatically
 
@@ -72,9 +76,72 @@ ghcr.io/relybytes/myapp-prod:2026-05-09.a464688
 ghcr.io/relybytes/myapp-prod:latest
 ```
 
+The `:latest` alias is only ever **pushed**. A build that is loaded into the local Docker daemon instead of being pushed gets the version tag only, because `:latest` is a fixed name in a daemon that may be shared with other jobs.
+
+## Runner requirements
+
+### GitHub-hosted runners (`ubuntu-latest`)
+
+Everything the action needs is already there. Nothing to install, no `sudo` required.
+
+- Docker and the `buildx` plugin: preinstalled.
+- Multi-platform builds: `binfmt` is already registered, so `linux/arm64` works out of the box.
+- Build cache: usually reachable, see [Build cache](#build-cache).
+
+### Self-hosted runners
+
+The action checks all of this at the start of the job and fails immediately, naming what is missing, rather than failing later with a confusing error.
+
+Must be present on the machine:
+
+- The `docker` CLI on `PATH`, and a Docker daemon the runner user can talk to **without `sudo`** (usually by adding the runner user to the `docker` group). The action never calls `sudo` and never writes to a machine-wide location.
+- The `docker buildx` plugin. The action builds with BuildKit and does not fall back to the legacy builder.
+- `RUNNER_TEMP` set, which the runner does by itself. It is where the per-run Docker configuration directory goes.
+- For a multi-platform build: QEMU `binfmt` handlers registered on the host, or `setup_qemu: "true"` (see below).
+
+Handled by the action itself, with nothing to configure:
+
+- A per-run `DOCKER_CONFIG` directory, so `docker login` never touches the shared `~/.docker/config.json`.
+- A buildx builder created and named for this run, passed explicitly with `--builder` to every buildx command, and removed at the end.
+- Detection of the Actions cache service, with a clean fallback when it is not reachable.
+- Detection of the platforms the builder can actually build, with an explicit error when emulation is missing.
+
+### Multi-platform builds and QEMU
+
+Building for an architecture other than the runner's needs QEMU `binfmt` handlers registered on the host. `binfmt` registration is **host-wide state**: on a self-hosted runner shared between repositories, every other job on the machine sees it. For that reason this action does not register it behind your back.
+
+What it does instead: after setting up buildx it asks the builder which platforms it supports, and if a requested platform is not among them it fails with the real cause, instead of letting the build die inside the first `RUN` with a bare `exec format error`.
+
+You have two ways to make multi-arch work on a self-hosted runner:
+
+1. Register `binfmt` once on the host, outside CI, which is the recommended option:
+
+   ```sh
+   docker run --privileged --rm tonistiigi/binfmt --install all
+   ```
+
+2. Let the action do it per job, with `setup_qemu: "true"`. This runs `docker/setup-qemu-action`, which needs a privileged container and changes state shared with other jobs on the machine.
+
+On GitHub-hosted runners neither is needed.
+
+## Build cache
+
+`cache: "true"` (the default) imports and exports a real BuildKit cache through the **GitHub Actions cache service**, scoped per image repository:
+
+```text
+--cache-from type=gha,scope={image-name}
+--cache-to   type=gha,mode=max,ignore-error=true,scope={image-name}
+```
+
+`ignore-error=true` means a cache export failure is logged and ignored: a cache problem never fails a build.
+
+The Actions cache service is only usable when `ACTIONS_RUNTIME_TOKEN` and the cache URL are present in the step environment. Not every runner exports those to composite shell steps, and a self-hosted runner may not be able to reach the service at all. When they are missing the action says so in one clear log line and builds without cache. To enable it in that case, export the Actions runtime variables into the job environment before this step.
+
+`no_cache: "true"` passes `--no-cache` and skips cache import and export entirely.
+
 ## Usage
 
-### Default — push to GHCR for the current repository
+### Default, push to GHCR for the current repository
 
 ```yaml
 name: Build and Push
@@ -125,6 +192,8 @@ Produces:
 registry.example.com/team/myapp-prod:2026-05-09.a464688
 ```
 
+Pass the host in `registry` and only the path in `image_name`. An `image_name` that starts with something Docker reads as a registry host, such as `ghcr.io/org/app`, is rejected with a message saying what to pass instead, because it would otherwise produce `ghcr.io/ghcr.io/org/app-prod`.
+
 ## Push to Docker Hub
 
 ```yaml
@@ -145,39 +214,45 @@ docker.io/relybytes/myapp-prod:2026-05-09.a464688
 
 ## Inputs
 
-| Input             | Required | Default                        | Description                                                                                   |
-| ----------------- | -------- | ------------------------------ | --------------------------------------------------------------------------------------------- |
-| `registry`        | no       | `ghcr.io`                      | Container registry host, for example `ghcr.io`, `docker.io`, or `registry.example.com`        |
-| `username`        | no       | `${{ github.actor }}`          | Registry username                                                                             |
-| `password`        | no       | `${{ github.token }}`          | Registry password or access token                                                             |
-| `image_name`      | no       | Current repository, lowercased | Base image name. The suffix is appended as `-{suffix}`                                        |
-| `dockerfile`      | no       | `Dockerfile`                   | Path to the Dockerfile. Can be relative to the repository root or to the build context        |
-| `context`         | no       | `.`                            | Build context directory                                                                       |
-| `suffix`          | no       | Derived from ref               | Override the suffix. Use `none` to disable it                                                 |
-| `version`         | no       | Auto-generated                 | Override the tag and skip `YYYY-MM-DD.shortsha` generation                                    |
-| `platforms`       | no       | `linux/amd64`                  | Comma-separated target platforms                                                              |
-| `build_args`      | no       | empty                          | Newline-separated build args, using `KEY=VALUE`                                               |
-| `target`          | no       | empty                          | Target build stage for multi-stage Dockerfiles                                                |
-| `labels`          | no       | OCI auto-labels                | Newline-separated OCI labels. When provided, they replace the auto-generated labels           |
-| `push`            | no       | `true`                         | Push the image to the registry. Set to `false` for local validation builds                    |
-| `push_on_pr`      | no       | `false`                        | Allow pushing images on pull request events                                                   |
-| `additional_tags` | no       | empty                          | Comma-separated additional tags on the suffixed image repository                              |
-| `latest`          | no       | `auto`                         | `true`, `false`, or `auto`. `auto` enables `:latest` only on `main` or `master` non-PR builds |
-| `cache`           | no       | `true`                         | Enable BuildKit inline cache                                                                  |
-| `no_cache`        | no       | `false`                        | Disable build cache entirely                                                                  |
+Boolean inputs accept only `true` or `false`, case-insensitively and ignoring surrounding whitespace. Anything else fails the build with a clear error instead of being silently read as the default.
+
+| Input             | Required | Default                        | Description                                                                                                             |
+| ----------------- | -------- | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
+| `registry`        | no       | `ghcr.io`                      | Container registry host, for example `ghcr.io`, `docker.io`, or `registry.example.com`                                   |
+| `username`        | no       | `${{ github.actor }}`          | Registry username                                                                                                       |
+| `password`        | no       | `${{ github.token }}`          | Registry password or access token. Masked by the action even when derived from a previous step                           |
+| `image_name`      | no       | Current repository, lowercased | Base image name, without registry host. The suffix is appended as `-{suffix}`                                            |
+| `dockerfile`      | no       | `Dockerfile`                   | Path to the Dockerfile. Can be relative to the repository root or to the build context                                  |
+| `context`         | no       | `.`                            | Build context directory                                                                                                 |
+| `suffix`          | no       | Derived from ref               | Override the suffix. Use `none` to disable it                                                                           |
+| `version`         | no       | Auto-generated                 | Override the tag and skip `YYYY-MM-DD.shortsha` generation                                                              |
+| `platforms`       | no       | `linux/amd64`                  | Comma-separated target platforms. See [Multi-platform builds and QEMU](#multi-platform-builds-and-qemu)                  |
+| `build_args`      | no       | empty                          | Newline-separated build args, `KEY=VALUE`. Values are passed through the environment, never on the command line          |
+| `target`          | no       | empty                          | Target build stage for multi-stage Dockerfiles                                                                          |
+| `labels`          | no       | OCI auto-labels                | Newline-separated OCI labels. When provided, they replace the auto-generated labels                                     |
+| `push`            | no       | `true`                         | Push the image to the registry. `true` or `false`                                                                       |
+| `push_on_pr`      | no       | `false`                        | Allow pushing images on pull request events. `true` or `false`                                                           |
+| `additional_tags` | no       | empty                          | Comma-separated additional tags on the suffixed image repository                                                         |
+| `latest`          | no       | `auto`                         | `true`, `false`, or `auto`. `auto` enables `:latest` only on `main` or `master` non-PR builds                            |
+| `cache`           | no       | `true`                         | Import and export the GitHub Actions build cache when the cache service is reachable. `true` or `false`                  |
+| `no_cache`        | no       | `false`                        | Disable the build cache entirely. `true` or `false`                                                                      |
+| `load`            | no       | `auto`                         | Load the image into the local Docker daemon when it is not pushed. `auto`, `true`, or `false`. See [Build without push](#build-without-push) |
+| `setup_qemu`      | no       | `false`                        | Register QEMU binfmt handlers for this job. `true` or `false`. Off by default because binfmt is host-wide state          |
 
 ## Outputs
 
-| Output             | Description                                                        |
-| ------------------ | ------------------------------------------------------------------ |
-| `image`            | Full image reference, for example `registry/name-suffix:version`   |
-| `image_repository` | Repository portion without tag, for example `registry/name-suffix` |
-| `version`          | Resolved tag, either `YYYY-MM-DD.shortsha` or the custom override  |
-| `suffix`           | Resolved environment suffix                                        |
-| `branch`           | Branch used to derive the suffix                                   |
-| `tags`             | All tags applied, newline-separated                                |
-| `digest`           | Image digest after push, when available                            |
-| `build_time`       | UTC timestamp of the build                                         |
+| Output             | Description                                                                          |
+| ------------------ | ------------------------------------------------------------------------------------ |
+| `image`            | Full image reference, for example `registry/name-suffix:version`                     |
+| `image_repository` | Repository portion without tag, for example `registry/name-suffix`                   |
+| `version`          | Resolved tag, either `YYYY-MM-DD.shortsha` or the custom override                    |
+| `suffix`           | Resolved environment suffix                                                          |
+| `branch`           | Branch used to derive the suffix                                                     |
+| `tags`             | All tags actually applied, newline-separated                                         |
+| `digest`           | Image digest after push, when the registry returns it                                |
+| `build_time`       | UTC timestamp of the build                                                           |
+
+When the digest cannot be read, the underlying error from `docker buildx imagetools inspect` is printed and a warning explains that the image was pushed but the `digest` output is empty. A digest problem never fails the build.
 
 ## Examples
 
@@ -192,6 +267,8 @@ docker.io/relybytes/myapp-prod:2026-05-09.a464688
       NODE_ENV=production
       VERSION=${{ github.ref_name }}
 ```
+
+On a self-hosted runner, add `setup_qemu: "true"` unless `binfmt` is already registered on the host.
 
 ### Custom suffix
 
@@ -289,7 +366,7 @@ ghcr.io/<owner>/<repo>-prod:stable
 ghcr.io/<owner>/<repo>-prod:production
 ```
 
-### PR build without push
+### PR validation build, including multi-arch
 
 ```yaml
 name: Validate Docker build
@@ -309,9 +386,12 @@ jobs:
         uses: relybytes/actions-docker-build-push@v1
         with:
           push: "false"
+          platforms: linux/amd64,linux/arm64
 ```
 
-Pull request builds do not push images by default.
+Pull request builds do not push images by default: `push` is forced to `false` and a warning says so.
+
+A validation build for several platforms works. When nothing is pushed and there is more than one platform, the action builds with no exporter at all: a broken Dockerfile still fails the job, which is the whole point, and no local image is needed to prove the build works.
 
 To explicitly allow push on pull request events:
 
@@ -333,9 +413,15 @@ Use this carefully, especially with external contributors or forked repositories
     push: "false"
 ```
 
-When `push=false`, the action uses `--load`.
+With `load: "auto"`, the default, a single-platform build that is not pushed is loaded into the local Docker daemon with `--load`, so a later step in the same job can run it. The `:latest` alias is not loaded.
 
-For this reason, `push=false` supports only a single platform. Multi-platform builds require `push=true`.
+The `load` input controls this:
+
+| `load`  | Behaviour                                                                                                   |
+| ------- | ----------------------------------------------------------------------------------------------------------- |
+| `auto`  | Load when the image is not pushed and there is a single platform. This is the historical behaviour           |
+| `false` | Never load. Use it on a shared runner when no later step needs the image locally                             |
+| `true`  | Always load when not pushing. Refused for more than one platform, because the local image store cannot hold a multi-platform image |
 
 ### Custom Dockerfile and context
 
@@ -402,25 +488,57 @@ For cross-repository or organization-level pushes, use a Personal Access Token w
 
 For external registries such as Docker Hub, Harbor, OVHcloud Managed Private Registry, AWS ECR, or private registries, use the credentials provided by the registry.
 
+## Behaviour on shared runners
+
+A persistent self-hosted runner can run jobs from several repositories at the same time, as the same user, sharing `$HOME`, the process table and one Docker daemon. The action is built for that:
+
+- **No global login state.** Every run gets its own `DOCKER_CONFIG` directory with a unique name under `$RUNNER_TEMP`, created with mode `700`. `docker login` writes the credential there, not into the shared `~/.docker/config.json`, and cleanup deletes that directory instead of running a global `docker logout` that would revoke another job's credential mid-push.
+- **No reliance on the current-builder marker.** The builder created for this run is passed explicitly with `--builder` to every buildx command, so another job's buildx setup cannot redirect this build into a container that is about to be removed.
+- **Nothing with a fixed name or path.** The Docker configuration directory and the builder are unique per run. The `:latest` alias is never loaded into the shared daemon.
+- **Cleanup only removes what this run created**, is safe to run twice, and is safe when the step that created the thing never ran. No images, containers or builders belonging to other jobs are touched.
+
 ## Security notes
 
-- Do not hardcode registry credentials in workflow files.
-- Store credentials in GitHub Secrets.
+- Do not hardcode registry credentials in workflow files. Store them in GitHub Secrets.
+- The registry password is masked by the action itself, so it is redacted in the log even when the caller computed it in a previous step, which is how AWS ECR login tokens are usually obtained. It is handed to `docker login` on stdin, never as an argument.
+- **Build arg values never appear on a command line.** They are exported into the step environment and only the key is passed as `--build-arg KEY`, because the process table is readable by every other job on a shared runner.
+- **Build args are not a place for secrets.** Their values are recorded in the image configuration and can be read back from the pushed image by anyone who can pull it. Use BuildKit secret mounts in your Dockerfile for real secrets.
 - Prefer pull-only or push-only robot accounts when your registry supports them.
-- Pull request events do not push images by default.
-- Use `push_on_pr: "true"` only when you fully trust the workflow context.
+- Pull request events do not push images by default. Use `push_on_pr: "true"` only when you fully trust the workflow context.
+
+### Residual risk this action cannot remove
+
+On a self-hosted runner where all jobs run as the same operating system user and share one Docker daemon, concurrent jobs can read each other's process environment and each other's images, and any job can talk to the daemon as root-equivalent. The per-run `DOCKER_CONFIG` narrows the window, but it cannot create isolation the machine does not have. If your jobs handle credentials of different trust levels, use ephemeral runners or one runner per repository; that is the only place where this can actually be fixed.
 
 ## Notes
 
 - Image names are forced to lowercase because GHCR rejects uppercase names and lowercase names are safer across registries.
-- Custom image names are sanitized while preserving `/`, so paths such as `team/myapp` are supported.
-- Docker tags generated from versions, Git tags, and additional tags are sanitized.
+- Image names and suffixes are sanitized to satisfy the registry grammar for a repository name, `[a-z0-9]+((\.|_|__|-*)[a-z0-9]+)*` per path component: a separator is never left at either end and runs of separators are collapsed. Branch `fix.` gives `myrepo-fix` and branch `_wip` gives `myrepo-wip`, both valid. `/` is preserved, so paths such as `team/myapp` work.
+- The image name is capped at the 255 characters a registry accepts, and tags at 128, so a long branch name cannot produce a reference the registry rejects.
+- Docker tags generated from versions, Git tags, and additional tags are sanitized the same way.
 - Each environment gets its own image repository, for example `myapp-prod`, `myapp-dev`, or `myapp-pr-42`.
 - This keeps `:latest` clean and allows per-environment retention or visibility rules on registries that support them.
 - The `org.opencontainers.image.source`, `org.opencontainers.image.revision`, `org.opencontainers.image.created`, and `org.opencontainers.image.version` labels are added automatically when `labels` is empty.
 - Pass custom `labels` to override the auto-generated OCI labels.
 - `latest=auto` publishes `:latest` only on `main` or `master` non-PR builds.
 - `digest` is available only when `push=true` and the registry returns an inspectable manifest digest.
+
+## Development
+
+The composite steps and the shared shell library are linted in CI:
+
+```sh
+pip install pyyaml
+python scripts/lint-steps.py action.yml --shell-file scripts/lib.sh
+```
+
+`scripts/lint-steps.py` loads `action.yml`, extracts each composite step's `run` body, replaces `${{ ... }}` expressions with a harmless placeholder, and runs `shellcheck` over the result. `scripts/lib.sh` holds every helper used by more than one step, so the sanitizers exist in exactly one place.
+
+Releases are tagged `vX.Y.Z`; a workflow then moves the `vX` and `vX.Y` alias tags to that commit.
+
+## Documentation
+
+Developer documentation lives in [`docs/`](docs/README.md).
 
 ## License
 

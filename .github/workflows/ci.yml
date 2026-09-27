@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Validate action.yml and shellcheck every step
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML
+        run: pip install --disable-pip-version-check pyyaml
+
+      - name: Install shellcheck
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends shellcheck
+          shellcheck --version
+
+      - name: Validate that every workflow and action file parses as YAML
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import pathlib
+          import sys
+
+          import yaml
+
+          paths = [pathlib.Path("action.yml")]
+          paths += sorted(pathlib.Path(".github/workflows").glob("*.yml"))
+          paths += sorted(pathlib.Path("examples").glob("*.yml"))
+
+          failed = False
+          for path in paths:
+              try:
+                  yaml.safe_load(path.read_text(encoding="utf-8"))
+              except yaml.YAMLError as error:
+                  print(f"FAIL  {path}: {error}")
+                  failed = True
+              else:
+                  print(f"ok    {path}")
+
+          sys.exit(1 if failed else 0)
+          PY
+
+      - name: Shellcheck every composite step and the shared library
+        run: python scripts/lint-steps.py action.yml --shell-file scripts/lib.sh

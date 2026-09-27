@@ -1,0 +1,25 @@
+name: Validate Docker build
+
+# Multi-architecture validation build on a pull request. Nothing is pushed and
+# nothing is loaded into the local Docker daemon: the build itself is the test.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Validate the Docker build for both architectures
+        uses: relybytes/actions-docker-build-push@v1
+        with:
+          push: "false"
+          platforms: linux/amd64,linux/arm64
+          # On a self-hosted runner without binfmt registered on the host, add:
+          # setup_qemu: "true"

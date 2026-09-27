@@ -1,0 +1,42 @@
+name: Build and Push on a self-hosted runner
+
+# The runner is persistent and shared with other repositories, so this workflow
+# keeps nothing on it: the image is pushed and never loaded into the local
+# Docker daemon.
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: [self-hosted, linux]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Build and push Docker image
+        id: image
+        uses: relybytes/actions-docker-build-push@v1
+        with:
+          registry: registry.example.com
+          username: ${{ secrets.REGISTRY_USER }}
+          password: ${{ secrets.REGISTRY_PASS }}
+          image_name: platform/api
+          platforms: linux/amd64,linux/arm64
+          # binfmt is registered once on the host, outside CI, with
+          # docker run --privileged --rm tonistiigi/binfmt --install all
+          # Set this to "true" instead to let the action register it per job.
+          setup_qemu: "false"
+          # Nothing in a later step needs the image locally.
+          load: "false"
+
+      - name: Report what was published
+        run: |
+          echo "Image:  ${{ steps.image.outputs.image }}"
+          echo "Digest: ${{ steps.image.outputs.digest }}"

@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  move-aliases:
+    name: Move the major and minor alias tags
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Move vX and vX.Y to this commit
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$RELEASE_TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "::error::Tag '$RELEASE_TAG' is not a vX.Y.Z version tag"
+            exit 1
+          fi
+
+          MAJOR="v${BASH_REMATCH[1]}"
+          MINOR="v${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          for alias in "$MAJOR" "$MINOR"; do
+            echo "Moving $alias to $TARGET_SHA"
+            git tag --force --annotate "$alias" "$TARGET_SHA" \
+              --message "Alias for $RELEASE_TAG"
+            git push --force origin "refs/tags/$alias"
+          done
+
+          echo "$RELEASE_TAG is now also reachable as $MAJOR and $MINOR" \
+            >>"$GITHUB_STEP_SUMMARY"

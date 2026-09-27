@@ -1,0 +1,8 @@
+# Normalize to LF in the repository. A composite action ships its steps as
+# shell scripts inside action.yml, and a CRLF line ending there becomes a
+# literal carriage return the Linux runner tries to execute.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
