@@ -1,5 +1,5 @@
 name: "Build & Push to Registry"
-description: "Build and push Docker images to any container registry with tags, cache, build args, and multi-arch support."
+description: "Build and push Docker images to any container registry with tags, GitHub Actions cache, build args, and multi-arch support."
 author: "RelyBytes"
 
 branding:
@@ -23,7 +23,7 @@ inputs:
     default: "${{ github.token }}"
 
   image_name:
-    description: "Base image name without tag. Defaults to the current repository, lowercased. The environment suffix is appended to it."
+    description: "Base image name, without tag and without registry host. Defaults to the current repository, lowercased. The environment suffix is appended to it."
     required: false
     default: ""
 
@@ -48,12 +48,12 @@ inputs:
     default: ""
 
   platforms:
-    description: "Target platforms."
+    description: "Target platforms, comma-separated. Any platform other than the runner architecture needs QEMU binfmt registered on the host, see setup_qemu."
     required: false
     default: "linux/amd64"
 
   build_args:
-    description: "Newline-separated build arguments, KEY=VALUE."
+    description: "Newline-separated build arguments, KEY=VALUE. Values are handed to buildx through the environment, never on the command line, but they are still recorded in the image config, so they are not a place for secrets."
     required: false
     default: ""
 
@@ -68,12 +68,12 @@ inputs:
     default: ""
 
   push:
-    description: "Push the image to the registry."
+    description: "Push the image to the registry. Must be 'true' or 'false'."
     required: false
     default: "true"
 
   push_on_pr:
-    description: "Allow pushing images on pull request events. Disabled by default for safety."
+    description: "Allow pushing images on pull request events. Disabled by default for safety. Must be 'true' or 'false'."
     required: false
     default: "false"
 
@@ -83,17 +83,27 @@ inputs:
     default: ""
 
   latest:
-    description: "Also publish the ':latest' tag on the suffixed image. 'auto' enables it on main/master non-PR builds only."
+    description: "Also publish the ':latest' tag on the suffixed image. Must be 'true', 'false', or 'auto'. 'auto' enables it on main/master non-PR builds only."
     required: false
     default: "auto"
 
   cache:
-    description: "Enable BuildKit inline cache."
+    description: "Import and export the GitHub Actions build cache when the Actions cache service is reachable. Must be 'true' or 'false'."
     required: false
     default: "true"
 
   no_cache:
-    description: "Disable build cache entirely."
+    description: "Disable the build cache entirely. Must be 'true' or 'false'."
+    required: false
+    default: "false"
+
+  load:
+    description: "Load the built image into the local Docker daemon when it is not pushed. 'auto' keeps the historical behaviour and loads single-platform builds only, 'false' never loads, 'true' always loads and is refused for multi-platform builds."
+    required: false
+    default: "auto"
+
+  setup_qemu:
+    description: "Register QEMU binfmt handlers before building. Off by default because binfmt registration is host-wide state that every other job on a shared runner sees."
     required: false
     default: "false"
 
@@ -133,13 +143,45 @@ outputs:
 runs:
   using: "composite"
   steps:
-    - name: Prepare an isolated Docker configuration
+    - name: Check prerequisites and prepare an isolated Docker configuration
       id: prepare
       shell: bash
       env:
         REG_PASS: ${{ inputs.password }}
       run: |
         set -euo pipefail
+
+        # SC1091: the path is only known at run time, shellcheck cannot follow it.
+        # shellcheck source=scripts/lib.sh disable=SC1091
+        source "$GITHUB_ACTION_PATH/scripts/lib.sh"
+
+        echo "::group::Checking prerequisites"
+
+        # Name what is missing here. A hosted runner has all of this
+        # preinstalled; a self-hosted one may have an old Docker without the
+        # buildx plugin, and the failure without this check comes much later and
+        # says nothing useful.
+        if ! command -v docker >/dev/null 2>&1; then
+          echo "::error::The 'docker' CLI is not on PATH. Install Docker on this runner, or use a runner that has it."
+          exit 1
+        fi
+
+        if ! docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
+          echo "::error::The Docker daemon is not reachable for user '$(id -un 2>/dev/null || echo unknown)'. Start Docker on this runner, or add the runner user to the docker group. This action never uses sudo."
+          exit 1
+        fi
+
+        if ! docker buildx version >/dev/null 2>&1; then
+          echo "::error::The 'docker buildx' plugin is not available. This action builds with BuildKit and cannot fall back to the legacy builder. Install the buildx plugin, or upgrade Docker to a version that ships it."
+          exit 1
+        fi
+
+        echo "Docker server:   $(docker version --format '{{.Server.Version}}' 2>/dev/null)"
+        echo "Buildx:          $(docker buildx version 2>/dev/null | head -n 1)"
+        echo "Runner arch:     $(uname -m) ($(uname -s))"
+        echo "Runner user:     $(id -un 2>/dev/null || echo unknown)"
+
+        echo "::endgroup::"
 
         echo "::group::Preparing an isolated Docker configuration"
 
@@ -157,16 +199,26 @@ runs:
         # run its own DOCKER_CONFIG, with a unique name, mode 700, under the
         # per-job temp directory that the runner wipes between jobs. Buildx
         # keeps its builder metadata there too, so the current-builder marker
-        # stops being shared as well.
-        CONFIG_DIR="$(mktemp -d "${RUNNER_TEMP:-/tmp}/docker-config-XXXXXXXXXX")"
+        # stops being shared as well. Nothing here is machine-wide and nothing
+        # needs sudo.
+        TEMP_BASE="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
+        if [[ ! -d "$TEMP_BASE" ]]; then
+          mkdir -p "$TEMP_BASE"
+        fi
+
+        CONFIG_DIR="$(mktemp -d "${TEMP_BASE%/}/docker-config-XXXXXXXXXX")"
         chmod 700 "$CONFIG_DIR"
 
         echo "DOCKER_CONFIG=$CONFIG_DIR" >>"$GITHUB_ENV"
 
-        echo "docker_config=$CONFIG_DIR" >>"$GITHUB_OUTPUT"
-        echo "docker_config_previous=${DOCKER_CONFIG:-}" >>"$GITHUB_OUTPUT"
+        set_output "docker_config" "$CONFIG_DIR"
+        set_output "docker_config_previous" "${DOCKER_CONFIG:-}"
 
         echo "Docker config:   $CONFIG_DIR"
+
+        if [[ -z "${RUNNER_TEMP:-}" ]]; then
+          echo "::warning::RUNNER_TEMP is not set, falling back to ${TEMP_BASE}. On a shared runner that directory is not wiped between jobs, so a hard-cancelled job could leave the registry credential on disk until the next cleanup."
+        fi
 
         echo "::endgroup::"
 
@@ -180,6 +232,9 @@ runs:
         INPUT_LATEST: ${{ inputs.latest }}
         INPUT_PUSH: ${{ inputs.push }}
         INPUT_PUSH_ON_PR: ${{ inputs.push_on_pr }}
+        INPUT_CACHE: ${{ inputs.cache }}
+        INPUT_NO_CACHE: ${{ inputs.no_cache }}
+        INPUT_LOAD: ${{ inputs.load }}
         REGISTRY: ${{ inputs.registry }}
         REPO: ${{ github.repository }}
         REF_NAME: ${{ github.ref_name }}
@@ -187,57 +242,53 @@ runs:
         EVENT_NAME: ${{ github.event_name }}
         HEAD_REF: ${{ github.head_ref }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         SHA: ${{ github.sha }}
       run: |
         set -euo pipefail
 
+        # SC1091: the path is only known at run time, shellcheck cannot follow it.
+        # shellcheck source=scripts/lib.sh disable=SC1091
+        source "$GITHUB_ACTION_PATH/scripts/lib.sh"
+
         echo "::group::Resolving image, version and push policy"
 
-        sanitize_repository_path() {
-          echo "$1" \
-            | tr '[:upper:]' '[:lower:]' \
-            | sed 's#[^a-z0-9._/-]#-#g' \
-            | sed 's#//*#/#g' \
-            | sed 's#^/*##' \
-            | sed 's#/*$##'
-        }
+        # Validate every boolean and enumerated input up front. An unrecognised
+        # value used to be indistinguishable from the default, so push: "yes"
+        # quietly meant "do not push" and latest: "1" quietly meant "auto".
+        PUSH_REQUESTED="$(require_boolean "push" "$INPUT_PUSH")"
+        PUSH_ON_PR="$(require_boolean "push_on_pr" "$INPUT_PUSH_ON_PR")"
+        CACHE_ENABLED="$(require_boolean "cache" "$INPUT_CACHE")"
+        NO_CACHE="$(require_boolean "no_cache" "$INPUT_NO_CACHE")"
+        LATEST_MODE="$(require_enum "latest" "$INPUT_LATEST" "true" "false" "auto")"
+        LOAD_MODE="$(require_enum "load" "$INPUT_LOAD" "true" "false" "auto")"
 
-        sanitize_suffix() {
-          echo "$1" \
-            | tr '[:upper:]' '[:lower:]' \
-            | sed 's#[^a-z0-9._-]#-#g' \
-            | sed 's#^-*##' \
-            | sed 's#-*$##'
-        }
+        IS_PULL_REQUEST="false"
+        if [[ "$EVENT_NAME" == "pull_request" || "$EVENT_NAME" == "pull_request_target" ]]; then
+          IS_PULL_REQUEST="true"
+        fi
 
-        sanitize_tag() {
-          local tag
-          tag="$(echo "$1" \
-            | tr '[:upper:]' '[:lower:]' \
-            | sed 's#[^a-z0-9._-]#-#g' \
-            | sed 's#^-*##' \
-            | cut -c1-128)"
+        # On pull request events github.sha is the ephemeral merge commit, which
+        # does not exist in the repository, so an image tagged with it could not
+        # be traced back to any commit. Use the head commit of the pull request.
+        BUILD_SHA="$SHA"
+        if [[ "$IS_PULL_REQUEST" == "true" && -n "$PR_HEAD_SHA" ]]; then
+          BUILD_SHA="$PR_HEAD_SHA"
+        fi
 
-          if [[ -z "$tag" ]]; then
-            echo "::error::Resolved Docker tag is empty after sanitization"
-            exit 1
-          fi
-
-          echo "$tag"
-        }
-
-        if [[ -z "$INPUT_IMAGE_NAME" ]]; then
-          BASE_NAME="$(sanitize_repository_path "$REPO")"
-        else
+        if [[ -n "$INPUT_IMAGE_NAME" ]]; then
+          assert_no_registry_host "$INPUT_IMAGE_NAME"
           BASE_NAME="$(sanitize_repository_path "$INPUT_IMAGE_NAME")"
+        else
+          BASE_NAME="$(sanitize_repository_path "$REPO")"
         fi
 
         if [[ -z "$BASE_NAME" ]]; then
-          echo "::error::Image name is empty after sanitization"
+          echo "::error::Image name is empty after sanitization. Pass a usable value in 'image_name'."
           exit 1
         fi
 
-        if [[ "$EVENT_NAME" == "pull_request" ]] || [[ "$EVENT_NAME" == "pull_request_target" ]]; then
+        if [[ "$IS_PULL_REQUEST" == "true" ]]; then
           BRANCH="$HEAD_REF"
         else
           BRANCH="$REF_NAME"
@@ -247,21 +298,24 @@ runs:
           BRANCH="unknown"
         fi
 
-        if [[ "$INPUT_SUFFIX" == "none" ]]; then
+        SUFFIX_INPUT="$(normalize "$INPUT_SUFFIX")"
+
+        # Compare after trimming and lowercasing, otherwise 'None' and ' none '
+        # fall through and produce a literal '-none' suffix.
+        if [[ "$SUFFIX_INPUT" == "none" ]]; then
           SUFFIX=""
-        elif [[ -n "$INPUT_SUFFIX" ]]; then
-          SUFFIX="$(sanitize_suffix "$INPUT_SUFFIX")"
-        elif [[ "$EVENT_NAME" == "pull_request" ]] || [[ "$EVENT_NAME" == "pull_request_target" ]]; then
-          SUFFIX="pr-${PR_NUMBER:-unknown}"
-          SUFFIX="$(sanitize_suffix "$SUFFIX")"
+        elif [[ -n "$SUFFIX_INPUT" ]]; then
+          SUFFIX="$(sanitize_name_component "$SUFFIX_INPUT")"
+        elif [[ "$IS_PULL_REQUEST" == "true" ]]; then
+          SUFFIX="$(sanitize_name_component "pr-${PR_NUMBER:-unknown}")"
         elif [[ "$REF_TYPE" == "tag" ]]; then
           SUFFIX="release"
         else
           case "$BRANCH" in
-            main|master)
+            main | master)
               SUFFIX="prod"
               ;;
-            develop|dev)
+            develop | dev)
               SUFFIX="dev"
               ;;
             staging)
@@ -277,7 +331,7 @@ runs:
               SUFFIX="feat"
               ;;
             *)
-              SUFFIX="$(sanitize_suffix "$BRANCH")"
+              SUFFIX="$(sanitize_name_component "$BRANCH")"
               ;;
           esac
         fi
@@ -288,17 +342,24 @@ runs:
           IMAGE_NAME="$BASE_NAME"
         fi
 
+        # Cap the repository name and check it against the registry grammar
+        # before printing it. A name that only looks right produces an
+        # 'invalid reference format' from the daemon long after the log has
+        # confidently announced the image.
+        IMAGE_NAME="$(cap_repository_name "$IMAGE_NAME")"
+        assert_repository_name "$IMAGE_NAME"
+
         IMAGE_REPOSITORY="${REGISTRY}/${IMAGE_NAME}"
 
         if [[ -n "$INPUT_VERSION" ]]; then
           VERSION="$(sanitize_tag "$INPUT_VERSION")"
         else
           DATE="$(date -u +%Y-%m-%d)"
-          SHORT_SHA="${SHA:0:7}"
+          SHORT_SHA="${BUILD_SHA:0:7}"
           VERSION="$(sanitize_tag "${DATE}.${SHORT_SHA}")"
         fi
 
-        case "$INPUT_LATEST" in
+        case "$LATEST_MODE" in
           true)
             LATEST_ENABLED="true"
             ;;
@@ -306,9 +367,7 @@ runs:
             LATEST_ENABLED="false"
             ;;
           *)
-            if [[ "$EVENT_NAME" != "pull_request" ]] \
-              && [[ "$EVENT_NAME" != "pull_request_target" ]] \
-              && [[ "$BRANCH" =~ ^(main|master)$ ]]; then
+            if [[ "$IS_PULL_REQUEST" != "true" ]] && [[ "$BRANCH" =~ ^(main|master)$ ]]; then
               LATEST_ENABLED="true"
             else
               LATEST_ENABLED="false"
@@ -316,11 +375,11 @@ runs:
             ;;
         esac
 
-        EFFECTIVE_PUSH="$INPUT_PUSH"
+        EFFECTIVE_PUSH="$PUSH_REQUESTED"
 
-        if [[ "$EFFECTIVE_PUSH" == "true" ]] \
-          && [[ "$EVENT_NAME" == "pull_request" || "$EVENT_NAME" == "pull_request_target" ]] \
-          && [[ "$INPUT_PUSH_ON_PR" != "true" ]]; then
+        if [[ "$EFFECTIVE_PUSH" == "true" ]] &&
+          [[ "$IS_PULL_REQUEST" == "true" ]] &&
+          [[ "$PUSH_ON_PR" != "true" ]]; then
           echo "::warning::Push disabled on pull request events. Set push_on_pr=true to override."
           EFFECTIVE_PUSH="false"
         fi
@@ -331,18 +390,23 @@ runs:
         echo "Image name:      $IMAGE_NAME"
         echo "Image repo:      $IMAGE_REPOSITORY"
         echo "Branch / event:  $BRANCH / $EVENT_NAME"
+        echo "Build commit:    $BUILD_SHA"
         echo "Version tag:     $VERSION"
         echo "Latest tag:      $LATEST_ENABLED"
         echo "Push enabled:    $EFFECTIVE_PUSH"
 
-        echo "base_name=$BASE_NAME" >> "$GITHUB_OUTPUT"
-        echo "image_name=$IMAGE_NAME" >> "$GITHUB_OUTPUT"
-        echo "image_repository=$IMAGE_REPOSITORY" >> "$GITHUB_OUTPUT"
-        echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
-        echo "suffix=$SUFFIX" >> "$GITHUB_OUTPUT"
-        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-        echo "latest_enabled=$LATEST_ENABLED" >> "$GITHUB_OUTPUT"
-        echo "push=$EFFECTIVE_PUSH" >> "$GITHUB_OUTPUT"
+        set_output "base_name" "$BASE_NAME"
+        set_output "image_name" "$IMAGE_NAME"
+        set_output "image_repository" "$IMAGE_REPOSITORY"
+        set_output "branch" "$BRANCH"
+        set_output "suffix" "$SUFFIX"
+        set_output "version" "$VERSION"
+        set_output "build_sha" "$BUILD_SHA"
+        set_output "latest_enabled" "$LATEST_ENABLED"
+        set_output "push" "$EFFECTIVE_PUSH"
+        set_output "cache" "$CACHE_ENABLED"
+        set_output "no_cache" "$NO_CACHE"
+        set_output "load_mode" "$LOAD_MODE"
 
         echo "::endgroup::"
 
@@ -353,9 +417,13 @@ runs:
         INPUT_CONTEXT: ${{ inputs.context }}
         INPUT_DOCKERFILE: ${{ inputs.dockerfile }}
         PLATFORMS: ${{ inputs.platforms }}
-        PUSH: ${{ steps.resolve.outputs.push }}
+        LOAD_MODE: ${{ steps.resolve.outputs.load_mode }}
       run: |
         set -euo pipefail
+
+        # SC1091: the path is only known at run time, shellcheck cannot follow it.
+        # shellcheck source=scripts/lib.sh disable=SC1091
+        source "$GITHUB_ACTION_PATH/scripts/lib.sh"
 
         echo "::group::Validating build context"
 
@@ -373,22 +441,128 @@ runs:
           exit 1
         fi
 
-        if [[ "$PUSH" != "true" && "$PLATFORMS" == *","* ]]; then
-          echo "::error::push=false supports only a single platform because --load cannot load a multi-platform image locally"
+        PLATFORM_LIST=""
+        while IFS= read -r platform; do
+          platform="$(trim "$platform")"
+          if [[ -z "$platform" ]]; then
+            continue
+          fi
+          if [[ -n "$PLATFORM_LIST" ]]; then
+            PLATFORM_LIST="${PLATFORM_LIST}"$'\n'
+          fi
+          PLATFORM_LIST="${PLATFORM_LIST}${platform}"
+        done <<<"$(printf '%s' "$PLATFORMS" | tr ',' '\n')"
+
+        PLATFORM_COUNT=0
+        if [[ -n "$PLATFORM_LIST" ]]; then
+          PLATFORM_COUNT="$(printf '%s\n' "$PLATFORM_LIST" | grep -c '' || true)"
+        fi
+
+        if [[ "$PLATFORM_COUNT" -eq 0 ]]; then
+          echo "::error::Input platforms is empty"
+          exit 1
+        fi
+
+        MULTI_PLATFORM="false"
+        if [[ "$PLATFORM_COUNT" -gt 1 ]]; then
+          MULTI_PLATFORM="true"
+        fi
+
+        # The only genuinely impossible combination: the local Docker image
+        # store has no representation for a multi-platform image, so buildx
+        # cannot load one. A build that is not pushed needs no local image at
+        # all, so this is refused only when the caller asked for the load
+        # explicitly, and the message names the load, not the push.
+        if [[ "$MULTI_PLATFORM" == "true" && "$LOAD_MODE" == "true" ]]; then
+          echo "::error::load=true cannot be combined with more than one platform: the local Docker image store cannot hold a multi-platform image. Drop load=true, or build a single platform."
           exit 1
         fi
 
         echo "Context:         $INPUT_CONTEXT"
         echo "Dockerfile:      $DOCKERFILE_PATH"
         echo "Platforms:       $PLATFORMS"
+        echo "Multi-platform:  $MULTI_PLATFORM"
 
-        echo "dockerfile_path=$DOCKERFILE_PATH" >> "$GITHUB_OUTPUT"
+        set_output "dockerfile_path" "$DOCKERFILE_PATH"
+        set_output "multi_platform" "$MULTI_PLATFORM"
+        set_output "platform_list" "$PLATFORM_LIST"
 
         echo "::endgroup::"
+
+    - name: Set up QEMU
+      if: inputs.setup_qemu == 'true'
+      uses: docker/setup-qemu-action@v4
+      with:
+        platforms: ${{ inputs.platforms }}
 
     - name: Set up Docker Buildx
       id: buildx
       uses: docker/setup-buildx-action@v4
+
+    - name: Verify builder platforms
+      id: builder
+      shell: bash
+      env:
+        BUILDER: ${{ steps.buildx.outputs.name }}
+        PLATFORM_LIST: ${{ steps.validate.outputs.platform_list }}
+        SETUP_QEMU: ${{ inputs.setup_qemu }}
+      run: |
+        set -euo pipefail
+
+        echo "::group::Verifying builder platforms"
+
+        if [[ -z "$BUILDER" ]]; then
+          echo "::error::Buildx setup did not report a builder name"
+          exit 1
+        fi
+
+        HOST_ARCH="$(uname -m)"
+        echo "Builder:         $BUILDER"
+        echo "Host arch:       $HOST_ARCH"
+
+        if ! INSPECT="$(docker buildx --builder "$BUILDER" inspect --bootstrap 2>&1)"; then
+          printf '%s\n' "$INSPECT"
+          echo "::error::Could not bootstrap the buildx builder '$BUILDER'. The output above is what buildx reported."
+          exit 1
+        fi
+
+        AVAILABLE="$(printf '%s\n' "$INSPECT" |
+          sed -n 's/^[[:space:]]*Platforms:[[:space:]]*//p' |
+          tr -d ' ' | tr ',' '\n' | sed '/^$/d' | sort -u)"
+
+        if [[ -z "$AVAILABLE" ]]; then
+          echo "::warning::Could not read the platform list from 'docker buildx inspect', skipping the emulation check."
+          echo "::endgroup::"
+          exit 0
+        fi
+
+        echo "Builder platforms: $(printf '%s' "$AVAILABLE" | tr '\n' ' ')"
+
+        MISSING=""
+        while IFS= read -r wanted; do
+          if [[ -z "$wanted" ]]; then
+            continue
+          fi
+          # A builder advertises linux/arm64 and linux/arm/v7, so accept both an
+          # exact match and a more specific variant of the requested platform.
+          if ! printf '%s\n' "$AVAILABLE" | grep -qx -F -- "$wanted" &&
+            ! printf '%s\n' "$AVAILABLE" | grep -q -F -- "${wanted}/"; then
+            MISSING="${MISSING}${wanted} "
+          fi
+        done <<<"$PLATFORM_LIST"
+
+        # Building for a foreign architecture needs QEMU binfmt handlers
+        # registered on the host. Without them the build dies deep inside the
+        # first RUN with a bare 'exec format error', so fail here with the real
+        # cause instead. This action does not register binfmt behind the
+        # caller's back: on a self-hosted runner shared between repositories
+        # that is host-wide state every other job sees, so it is opt-in.
+        if [[ -n "$MISSING" ]]; then
+          echo "::error::This builder cannot build for: ${MISSING% }. The runner is $HOST_ARCH and emulation for those platforms is not registered on it. Either register binfmt once on the host with 'docker run --privileged --rm tonistiigi/binfmt --install all', or pass setup_qemu: \"true\" to let this action register it for the job, which changes host-wide state shared with other jobs. Current setup_qemu=$SETUP_QEMU."
+          exit 1
+        fi
+
+        echo "::endgroup::"
 
     - name: Login to registry
       if: steps.resolve.outputs.push == 'true'
@@ -403,12 +577,12 @@ runs:
         echo "::group::Authenticating to $REG_HOST"
 
         if [[ -z "$REG_USER" ]]; then
-          echo "::error::Registry username is empty"
+          echo "::error::Registry username is empty. Pass a value in the 'username' input."
           exit 1
         fi
 
         if [[ -z "$REG_PASS" ]]; then
-          echo "::error::Registry password is empty. Pass 'password' or grant 'packages: write' for the default GITHUB_TOKEN on ghcr.io."
+          echo "::error::Registry password is empty. Pass a token in the 'password' input. The default is github.token, so an empty value means the workflow overrode 'password' with an expression that resolved to nothing, for example a secret that is not set."
           exit 1
         fi
 
@@ -425,19 +599,22 @@ runs:
       env:
         BUILDER: ${{ steps.buildx.outputs.name }}
         IMAGE_REPOSITORY: ${{ steps.resolve.outputs.image_repository }}
+        IMAGE_NAME: ${{ steps.resolve.outputs.image_name }}
         VERSION: ${{ steps.resolve.outputs.version }}
         LATEST_ENABLED: ${{ steps.resolve.outputs.latest_enabled }}
         REF_TYPE: ${{ github.ref_type }}
         REF_NAME: ${{ github.ref_name }}
-        SHA: ${{ github.sha }}
+        SHA: ${{ steps.resolve.outputs.build_sha }}
         DOCKERFILE_PATH: ${{ steps.validate.outputs.dockerfile_path }}
+        MULTI_PLATFORM: ${{ steps.validate.outputs.multi_platform }}
         BUILD_CONTEXT: ${{ inputs.context }}
         BUILD_ARGS: ${{ inputs.build_args }}
         BUILD_TARGET: ${{ inputs.target }}
         PLATFORMS: ${{ inputs.platforms }}
         PUSH: ${{ steps.resolve.outputs.push }}
-        CACHE: ${{ inputs.cache }}
-        NO_CACHE: ${{ inputs.no_cache }}
+        CACHE: ${{ steps.resolve.outputs.cache }}
+        NO_CACHE: ${{ steps.resolve.outputs.no_cache }}
+        LOAD_MODE: ${{ steps.resolve.outputs.load_mode }}
         LABELS: ${{ inputs.labels }}
         ADDITIONAL_TAGS: ${{ inputs.additional_tags }}
         SERVER_URL: ${{ github.server_url }}
@@ -445,32 +622,44 @@ runs:
       run: |
         set -euo pipefail
 
+        # SC1091: the path is only known at run time, shellcheck cannot follow it.
+        # shellcheck source=scripts/lib.sh disable=SC1091
+        source "$GITHUB_ACTION_PATH/scripts/lib.sh"
+
         echo "::group::Building $IMAGE_REPOSITORY:$VERSION"
 
-        sanitize_tag() {
-          local tag
-          tag="$(echo "$1" \
-            | tr '[:upper:]' '[:lower:]' \
-            | sed 's#[^a-z0-9._-]#-#g' \
-            | sed 's#^-*##' \
-            | cut -c1-128)"
-
-          if [[ -z "$tag" ]]; then
-            echo "::error::Resolved Docker tag is empty after sanitization"
-            exit 1
-          fi
-
-          echo "$tag"
-        }
-
-        BUILD_START=$(date +%s)
+        BUILD_START="$(date +%s)"
         BUILD_TIME="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
         FULL_IMAGE="${IMAGE_REPOSITORY}:${VERSION}"
+
+        # 'auto' reproduces the historical behaviour: load only when the image is
+        # not pushed and there is a single platform to load.
+        LOAD="false"
+        case "$LOAD_MODE" in
+          true)
+            LOAD="true"
+            ;;
+          false)
+            LOAD="false"
+            ;;
+          *)
+            if [[ "$PUSH" != "true" && "$MULTI_PLATFORM" != "true" ]]; then
+              LOAD="true"
+            fi
+            ;;
+        esac
 
         TAGS=("$FULL_IMAGE")
 
         if [[ "$LATEST_ENABLED" == "true" ]]; then
-          TAGS+=("${IMAGE_REPOSITORY}:latest")
+          if [[ "$LOAD" == "true" ]]; then
+            # ':latest' is a fixed name in a Docker daemon shared with every
+            # other job on this runner, so loading it would overwrite an alias
+            # another job may be using. A local build keeps the version tag only.
+            echo "::notice::Not applying the ':latest' alias to a local build, it would overwrite that tag in the shared Docker daemon. It is still published on pushed builds."
+          else
+            TAGS+=("${IMAGE_REPOSITORY}:latest")
+          fi
         fi
 
         if [[ "$REF_TYPE" == "tag" ]]; then
@@ -478,119 +667,138 @@ runs:
         fi
 
         if [[ -n "$ADDITIONAL_TAGS" ]]; then
-          IFS=',' read -ra EXTRA <<< "$ADDITIONAL_TAGS"
-          for t in "${EXTRA[@]}"; do
-            t="$(echo "$t" | xargs)"
-            [[ -z "$t" ]] && continue
-            t="$(sanitize_tag "$t")"
-            TAGS+=("${IMAGE_REPOSITORY}:${t}")
+          IFS=',' read -r -a EXTRA_TAGS <<<"$ADDITIONAL_TAGS"
+          for extra in ${EXTRA_TAGS[@]+"${EXTRA_TAGS[@]}"}; do
+            extra="$(trim "$extra")"
+            if [[ -z "$extra" ]]; then
+              continue
+            fi
+            TAGS+=("${IMAGE_REPOSITORY}:$(sanitize_tag "$extra")")
           done
-        fi
-
-        TAG_ARGS=()
-        for t in "${TAGS[@]}"; do
-          TAG_ARGS+=("--tag" "$t")
-          echo "Tag: $t"
-        done
-
-        # Build args are passed by key only. '--build-arg KEY=VALUE' puts the
-        # value in argv, where any other job on the runner can read it with ps;
-        # '--build-arg KEY' makes buildx take the value from the environment.
-        BUILD_ARG_OPTS=()
-        if [[ -n "$BUILD_ARGS" ]]; then
-          while IFS= read -r line; do
-            line="$(echo "$line" | xargs)"
-            [[ -z "$line" ]] && continue
-            if [[ "$line" != *"="* ]]; then
-              echo "::error::build_args entry '$line' is not KEY=VALUE"
-              exit 1
-            fi
-            arg_key="${line%%=*}"
-            arg_value="${line#*=}"
-            if [[ ! "$arg_key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-              echo "::error::build_args key '$arg_key' is not a valid environment variable name"
-              exit 1
-            fi
-            export "${arg_key}=${arg_value}"
-            BUILD_ARG_OPTS+=("--build-arg" "$arg_key")
-          done <<< "$BUILD_ARGS"
-        fi
-
-        LABEL_OPTS=()
-        if [[ -n "$LABELS" ]]; then
-          while IFS= read -r line; do
-            line="$(echo "$line" | xargs)"
-            [[ -z "$line" ]] && continue
-            LABEL_OPTS+=("--label" "$line")
-          done <<< "$LABELS"
-        else
-          LABEL_OPTS+=(
-            "--label" "org.opencontainers.image.source=${SERVER_URL}/${REPO}"
-            "--label" "org.opencontainers.image.revision=${SHA}"
-            "--label" "org.opencontainers.image.created=${BUILD_TIME}"
-            "--label" "org.opencontainers.image.version=${VERSION}"
-          )
-        fi
-
-        EXTRA_OPTS=()
-
-        if [[ -n "$BUILD_TARGET" ]]; then
-          EXTRA_OPTS+=("--target" "$BUILD_TARGET")
-        fi
-
-        if [[ "$NO_CACHE" == "true" ]]; then
-          EXTRA_OPTS+=("--no-cache")
-        fi
-
-        if [[ "$CACHE" == "true" ]]; then
-          EXTRA_OPTS+=("--build-arg" "BUILDKIT_INLINE_CACHE=1")
-        fi
-
-        if [[ "$PUSH" == "true" ]]; then
-          EXTRA_OPTS+=("--push")
-        else
-          EXTRA_OPTS+=("--load")
         fi
 
         # Always name the builder. Without --builder, buildx reads the global
         # current-builder marker, which on a self-hosted runner is shared state:
         # another job's setup-buildx-action moves it, this build then runs inside
         # that job's buildkit container, and dies when its post step removes it.
-        docker buildx build \
-          --builder "$BUILDER" \
-          --platform "$PLATFORMS" \
-          --file "$DOCKERFILE_PATH" \
-          "${TAG_ARGS[@]}" \
-          "${BUILD_ARG_OPTS[@]}" \
-          "${LABEL_OPTS[@]}" \
-          "${EXTRA_OPTS[@]}" \
-          "$BUILD_CONTEXT"
+        BUILD_CMD=(
+          docker buildx build
+          --builder "$BUILDER"
+          --platform "$PLATFORMS"
+          --file "$DOCKERFILE_PATH"
+        )
 
-        BUILD_END=$(date +%s)
+        for tag in "${TAGS[@]}"; do
+          BUILD_CMD+=(--tag "$tag")
+          echo "Tag: $tag"
+        done
+
+        # Build args are passed by key only. '--build-arg KEY=VALUE' puts the
+        # value in argv, where any other job on the runner can read it with ps;
+        # '--build-arg KEY' makes buildx take the value from the environment.
+        if [[ -n "$BUILD_ARGS" ]]; then
+          while IFS= read -r line || [[ -n "$line" ]]; do
+            line="$(trim "$line")"
+            if [[ -z "$line" || "$line" == "#"* ]]; then
+              continue
+            fi
+            if [[ "$line" != *"="* ]]; then
+              echo "::error::build_args entry '$line' is not KEY=VALUE"
+              exit 1
+            fi
+            arg_key="$(trim "${line%%=*}")"
+            arg_value="${line#*=}"
+            if [[ ! "$arg_key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+              echo "::error::build_args key '$arg_key' is not a valid environment variable name"
+              exit 1
+            fi
+            export "${arg_key}=${arg_value}"
+            BUILD_CMD+=(--build-arg "$arg_key")
+          done <<<"$BUILD_ARGS"
+        fi
+
+        if [[ -n "$LABELS" ]]; then
+          while IFS= read -r line || [[ -n "$line" ]]; do
+            line="$(trim "$line")"
+            if [[ -z "$line" ]]; then
+              continue
+            fi
+            BUILD_CMD+=(--label "$line")
+          done <<<"$LABELS"
+        else
+          BUILD_CMD+=(
+            --label "org.opencontainers.image.source=${SERVER_URL}/${REPO}"
+            --label "org.opencontainers.image.revision=${SHA}"
+            --label "org.opencontainers.image.created=${BUILD_TIME}"
+            --label "org.opencontainers.image.version=${VERSION}"
+          )
+        fi
+
+        if [[ -n "$BUILD_TARGET" ]]; then
+          BUILD_CMD+=(--target "$BUILD_TARGET")
+        fi
+
+        # Real cache import and export, through the GitHub Actions cache service.
+        # The old BUILDKIT_INLINE_CACHE build arg exported an inline cache that
+        # nothing ever imported, because there was no --cache-from anywhere in
+        # the action: every build was cold while the input defaulted to on.
+        CACHE_SCOPE="$(printf '%s' "$IMAGE_NAME" | tr '/' '-')"
+
+        if [[ "$NO_CACHE" == "true" ]]; then
+          BUILD_CMD+=(--no-cache)
+          echo "Cache:           disabled by no_cache=true"
+        elif [[ "$CACHE" != "true" ]]; then
+          echo "Cache:           disabled by cache=false"
+        elif [[ -n "${ACTIONS_RUNTIME_TOKEN:-}" ]] &&
+          [[ -n "${ACTIONS_CACHE_URL:-}${ACTIONS_RESULTS_URL:-}" ]]; then
+          # ignore-error keeps a cache export failure from failing the build.
+          BUILD_CMD+=(
+            --cache-from "type=gha,scope=${CACHE_SCOPE}"
+            --cache-to "type=gha,mode=max,ignore-error=true,scope=${CACHE_SCOPE}"
+          )
+          echo "Cache:           GitHub Actions cache, scope ${CACHE_SCOPE}"
+        else
+          echo "::notice::Build cache is unavailable: the GitHub Actions cache service is not reachable from this step, because ACTIONS_RUNTIME_TOKEN and the cache URL are not exported to composite shell steps on every runner. Building cold. To enable the cache, export the Actions runtime variables into the job environment before this step."
+          echo "Cache:           unavailable, building cold"
+        fi
+
+        if [[ "$PUSH" == "true" ]]; then
+          BUILD_CMD+=(--push)
+        elif [[ "$LOAD" == "true" ]]; then
+          BUILD_CMD+=(--load)
+        else
+          # No exporter at all. The build still fails on a broken Dockerfile,
+          # which is the whole point of a validation build, and this is what
+          # makes a multi-platform build possible without pushing.
+          echo "Output:          none, validation build only"
+        fi
+
+        BUILD_CMD+=("$BUILD_CONTEXT")
+
+        "${BUILD_CMD[@]}"
+
+        BUILD_END="$(date +%s)"
         BUILD_DURATION=$((BUILD_END - BUILD_START))
 
         echo "Build completed in ${BUILD_DURATION}s"
 
         DIGEST=""
         if [[ "$PUSH" == "true" ]]; then
-          DIGEST="$(docker buildx --builder "$BUILDER" imagetools inspect "$FULL_IMAGE" --format '{{json .Manifest.Digest}}' 2>/dev/null | tr -d '"' || true)"
-          if [[ -n "$DIGEST" ]]; then
+          # Report why the digest is missing instead of swallowing every auth,
+          # network and registry error into a bland 'Digest: unavailable'.
+          if INSPECT_OUTPUT="$(docker buildx --builder "$BUILDER" imagetools inspect "$FULL_IMAGE" --format '{{json .Manifest.Digest}}' 2>&1)"; then
+            DIGEST="$(printf '%s' "$INSPECT_OUTPUT" | tr -d '"' | tr -d '\n')"
             echo "Digest: $DIGEST"
           else
-            echo "Digest: unavailable"
+            printf '%s\n' "$INSPECT_OUTPUT"
+            echo "::warning::Could not read the digest of $FULL_IMAGE. The output above is what 'docker buildx imagetools inspect' reported. The image was pushed, only the 'digest' output is empty."
           fi
         fi
 
-        echo "image=$FULL_IMAGE" >> "$GITHUB_OUTPUT"
-
-        {
-          echo "tags<<EOF"
-          printf '%s\n' "${TAGS[@]}"
-          echo "EOF"
-        } >> "$GITHUB_OUTPUT"
-
-        echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
-        echo "build_time=$BUILD_TIME" >> "$GITHUB_OUTPUT"
+        set_output "image" "$FULL_IMAGE"
+        set_output "tags" "$(printf '%s\n' "${TAGS[@]}")"
+        set_output "digest" "$DIGEST"
+        set_output "build_time" "$BUILD_TIME"
 
         echo "::endgroup::"
 
