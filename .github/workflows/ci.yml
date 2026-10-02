@@ -1,9 +1,11 @@
 name: CI
 
 on:
+  # Every branch, so that a change to the action is exercised on a real runner
+  # before it reaches main and a release tag.
   push:
     branches:
-      - main
+      - "**"
   pull_request:
 
 permissions:
@@ -16,10 +18,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
 
@@ -59,5 +61,214 @@ jobs:
           sys.exit(1 if failed else 0)
           PY
 
+      - name: Check that every action is pinned to a full commit SHA
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          # A tag can be moved to other code after review; a commit cannot.
+          # The version goes in a trailing comment so that a reader, and a
+          # bump, can tell which release the commit is.
+          USES = re.compile(r"^\s*(?:-\s+)?uses:\s*(?P<ref>[^\s#]+)\s*(?P<comment>#.*)?$")
+          PINNED = re.compile(r"@[0-9a-f]{40}$")
+          VERSION = re.compile(r"#\s*v\d")
+
+          paths = [pathlib.Path("action.yml")]
+          paths += sorted(pathlib.Path(".github/workflows").glob("*.yml"))
+
+          failed = False
+          for path in paths:
+              lines = path.read_text(encoding="utf-8").splitlines()
+              for number, line in enumerate(lines, start=1):
+                  match = USES.match(line)
+                  if not match:
+                      continue
+                  ref = match["ref"].strip("'\"")
+                  if ref.startswith("./"):
+                      continue
+                  if PINNED.search(ref) and VERSION.search(match["comment"] or ""):
+                      print(f"ok    {path}:{number}: {ref}")
+                  else:
+                      print(f"FAIL  {path}:{number}: {ref} is not pinned to a full commit SHA with its version in a comment")
+                      failed = True
+
+          sys.exit(1 if failed else 0)
+          PY
+
       - name: Shellcheck every composite step and the shared library
         run: python scripts/lint-steps.py action.yml --shell-file scripts/lib.sh
+
+  cache:
+    name: Build cache round trip, buildx ${{ matrix.buildx }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The buildx that ships with the runner image.
+          - buildx: runner
+          # The buildx of the self-hosted runners that build the company
+          # images. It predates cache service v2 and drops a gha cache entry
+          # that has no url, which the explicit cache attributes work around.
+          - buildx: v0.12.1
+            sha256: 716321df8ca9c82ffe96f37e9f4aa1199d4969795836dbd57ef72d12e3ac5085
+
+    env:
+      # Unique per run, attempt and matrix leg. It names the test images, so
+      # every leg gets cache scopes of its own and two legs or two runs never
+      # race on one cache index, and it is a build arg of the slow step, so the
+      # first build of a leg can only miss the cache.
+      RUN_TAG: run-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install buildx ${{ matrix.buildx }}
+        if: matrix.buildx != 'runner'
+        env:
+          BUILDX_VERSION: ${{ matrix.buildx }}
+          BUILDX_SHA256: ${{ matrix.sha256 }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/docker/buildx/releases/download/${BUILDX_VERSION}/buildx-${BUILDX_VERSION}.linux-amd64"
+          curl --fail --silent --show-error --location --output "${RUNNER_TEMP}/docker-buildx" "$url"
+          echo "${BUILDX_SHA256}  ${RUNNER_TEMP}/docker-buildx" | sha256sum --check --strict
+          # The Docker CLI looks in /usr/local/lib/docker/cli-plugins before the
+          # system directories, and the per-run DOCKER_CONFIG of the action has
+          # no plugins of its own. This ephemeral runner is not shared, so the
+          # machine-wide install is fine here.
+          sudo install -D -m 0755 "${RUNNER_TEMP}/docker-buildx" /usr/local/lib/docker/cli-plugins/docker-buildx
+          # Check with an empty DOCKER_CONFIG, the way the action resolves it.
+          resolved="$(DOCKER_CONFIG="$(mktemp -d)" docker buildx version)"
+          echo "$resolved"
+          if [[ "$resolved" != *" ${BUILDX_VERSION} "* ]]; then
+            echo "::error::The Docker CLI does not resolve buildx ${BUILDX_VERSION}: ${resolved}"
+            exit 1
+          fi
+
+      - name: Start the clock
+        run: echo "CLOCK_START=$(date +%s)" >>"$GITHUB_ENV"
+
+      - name: Build image A, cold
+        id: a1
+        uses: ./
+        with:
+          context: tests/cache
+          image_name: cache-test/${{ env.RUN_TAG }}-a
+          suffix: none
+          version: first
+          latest: "false"
+          push: "false"
+          build_args: |
+            RUN_ID=${{ env.RUN_TAG }}
+            VARIANT=a
+
+      - name: Stop the clock for image A, cold
+        run: echo "CLOCK_A1=$(date +%s)" >>"$GITHUB_ENV"
+
+      # A second image between the two builds of A. If both images shared a
+      # cache scope, its export would replace the cache index of A and the
+      # second build of A would miss.
+      - name: Build image B, cold
+        id: b1
+        uses: ./
+        with:
+          context: tests/cache
+          image_name: cache-test/${{ env.RUN_TAG }}-b
+          suffix: none
+          version: first
+          latest: "false"
+          push: "false"
+          build_args: |
+            RUN_ID=${{ env.RUN_TAG }}
+            VARIANT=b
+
+      - name: Stop the clock for image B, cold
+        run: echo "CLOCK_B1=$(date +%s)" >>"$GITHUB_ENV"
+
+      - name: Build image A again, expected from the cache
+        id: a2
+        uses: ./
+        with:
+          context: tests/cache
+          image_name: cache-test/${{ env.RUN_TAG }}-a
+          suffix: none
+          version: second
+          latest: "false"
+          push: "false"
+          build_args: |
+            RUN_ID=${{ env.RUN_TAG }}
+            VARIANT=a
+
+      - name: Stop the clock for image A, from the cache
+        run: echo "CLOCK_A2=$(date +%s)" >>"$GITHUB_ENV"
+
+      - name: Check that the second build of image A came from the cache
+        env:
+          BUILDX: ${{ matrix.buildx }}
+          IMAGE_A1: ${{ steps.a1.outputs.image }}
+          IMAGE_B1: ${{ steps.b1.outputs.image }}
+          IMAGE_A2: ${{ steps.a2.outputs.image }}
+        run: |
+          set -euo pipefail
+
+          # Each builder this action creates starts empty and is removed at the
+          # end of its run, so the second build of A can only reuse the slow
+          # step through the GitHub Actions cache.
+          nonce() {
+            docker run --rm "$1" cat /cache-test-nonce
+          }
+
+          NONCE_A1="$(nonce "$IMAGE_A1")"
+          NONCE_B1="$(nonce "$IMAGE_B1")"
+          NONCE_A2="$(nonce "$IMAGE_A2")"
+
+          SECONDS_A1=$((CLOCK_A1 - CLOCK_START))
+          SECONDS_B1=$((CLOCK_B1 - CLOCK_A1))
+          SECONDS_A2=$((CLOCK_A2 - CLOCK_B1))
+
+          {
+            echo "### Build cache round trip, buildx ${BUILDX}"
+            echo ""
+            echo "| Build | Expected | Nonce of the slow step | Seconds, whole action |"
+            echo "| --- | --- | --- | --- |"
+            echo "| Image A, first | cold | \`${NONCE_A1}\` | ${SECONDS_A1} |"
+            echo "| Image B | cold | \`${NONCE_B1}\` | ${SECONDS_B1} |"
+            echo "| Image A, second | from the cache | \`${NONCE_A2}\` | ${SECONDS_A2} |"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+          echo "Image A, first:  ${NONCE_A1}, ${SECONDS_A1}s"
+          echo "Image B:         ${NONCE_B1}, ${SECONDS_B1}s"
+          echo "Image A, second: ${NONCE_A2}, ${SECONDS_A2}s"
+
+          if [[ -z "$NONCE_A1" || -z "$NONCE_B1" || -z "$NONCE_A2" ]]; then
+            echo "::error::A test image has no nonce, so the fixture did not build as expected."
+            exit 1
+          fi
+
+          # The slow step sleeps 30 seconds. A first build faster than that
+          # never ran it, and then nothing below proves anything.
+          if ((SECONDS_A1 < 30)); then
+            echo "::error::The first build of image A took ${SECONDS_A1}s, less than the 30s its slow step sleeps: it did not run that step, so the premise of the test does not hold."
+            exit 1
+          fi
+
+          if [[ "$NONCE_B1" == "$NONCE_A1" ]]; then
+            echo "::error::Image B carries the slow layer of image A: one image received the cache of the other."
+            exit 1
+          fi
+
+          if [[ "$NONCE_A2" != "$NONCE_A1" ]]; then
+            echo "::error::The second build of image A ran its slow step again instead of reusing it from the GitHub Actions cache."
+            exit 1
+          fi
+
+          echo "Cache hit: the second build of image A reused the layer the first build exported, with image B built in between."
