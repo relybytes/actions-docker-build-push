@@ -86,7 +86,7 @@ Everything the action needs is already there. Nothing to install, no `sudo` requ
 
 - Docker and the `buildx` plugin: preinstalled.
 - Multi-platform builds: `binfmt` is already registered, so `linux/arm64` works out of the box.
-- Build cache: usually reachable, see [Build cache](#build-cache).
+- Build cache: works out of the box, see [Build cache](#build-cache).
 
 ### Self-hosted runners
 
@@ -103,7 +103,7 @@ Handled by the action itself, with nothing to configure:
 
 - A per-run `DOCKER_CONFIG` directory, so `docker login` never touches the shared `~/.docker/config.json`.
 - A buildx builder created and named for this run, passed explicitly with `--builder` to every buildx command, and removed at the end.
-- Detection of the Actions cache service, with a clean fallback when it is not reachable.
+- Reading the address of the Actions cache service from the runner, with a clean fallback where the runner provides none.
 - Detection of the platforms the builder can actually build, with an explicit error when emulation is missing.
 
 ### Multi-platform builds and QEMU
@@ -126,18 +126,66 @@ On GitHub-hosted runners neither is needed.
 
 ## Build cache
 
-`cache: "true"` (the default) imports and exports a real BuildKit cache through the **GitHub Actions cache service**, scoped per image repository:
+`cache: "true"` (the default) imports and exports a BuildKit cache through the **GitHub Actions cache service**:
 
 ```text
---cache-from type=gha,scope={image-name}
---cache-to   type=gha,mode=max,ignore-error=true,scope={image-name}
+--cache-from type=gha,scope={scope},{service address}
+--cache-to   type=gha,mode=max,ignore-error=true,scope={scope},{service address}
 ```
 
-`ignore-error=true` means a cache export failure is logged and ignored: a cache problem never fails a build.
+`mode=max` caches the layers of every build stage, not only those of the final image. A cache problem never fails a build: `ignore-error=true` turns a failed export into a log line, and BuildKit treats a failed import as an empty cache and builds cold.
 
-The Actions cache service is only usable when `ACTIONS_RUNTIME_TOKEN` and the cache URL are present in the step environment. Not every runner exports those to composite shell steps, and a self-hosted runner may not be able to reach the service at all. When they are missing the action says so in one clear log line and builds without cache. To enable it in that case, export the Actions runtime variables into the job environment before this step.
+`no_cache: "true"` passes `--no-cache` and skips cache import and export entirely. `cache: "false"` builds without importing or exporting anything.
 
-`no_cache: "true"` passes `--no-cache` and skips cache import and export entirely.
+### What the action reads from the runner, and why
+
+The runner gives the address of the cache service, and the job token for it, to JavaScript actions only. This action is a composite action whose build runs in a shell step, which never sees them. When the cache is in use, the action therefore runs one small `actions/github-script` step, pinned by commit, that reads these variables:
+
+| Variable                   | What it carries                                                                                           |
+| -------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `ACTIONS_RUNTIME_TOKEN`    | The job token for the cache service. The runner registers it as a secret, so the log shows it as `***`    |
+| `ACTIONS_RESULTS_URL`      | The address of the current cache service, v2                                                              |
+| `ACTIONS_CACHE_SERVICE_V2` | Set where the repository uses cache service v2, which is every repository on github.com                  |
+| `ACTIONS_CACHE_URL`        | The address of the legacy cache service, v1, which GitHub Enterprise Server still uses                    |
+| `ACTIONS_CACHE_MODE`       | The `cache-mode` of the job: `read`, `write`, `write-only` or `none`                                      |
+
+It hands them to the build step as step outputs, and that is the whole exposure:
+
+- They reach the build step and nothing else. They are **not** exported to the job environment, so the later steps of your job do not see them, and nothing is left behind when the action ends.
+- The step prints the names of the variables it found, never a value.
+- The token never reaches a command line: buildx reads it from its own environment. Only the service address and protocol version go on the command line, as cache attributes.
+
+The address is passed explicitly, as `url`, `url_v2` and `version=2`, instead of being left for buildx to find, because buildx older than 0.21 reads only the legacy `ACTIONS_CACHE_URL` and silently drops the cache when that is missing. With the explicit attributes the cache also works on self-hosted runners with an older Docker installation, such as buildx 0.12: the builder container always runs a current BuildKit, which speaks cache service v2.
+
+The `cache-mode` of the job is honoured the way `actions/cache` honours it: `read` imports only, `write-only` exports only, and `none` builds without the cache. The cache service enforces the mode in any case; honouring it saves an export that would be refused.
+
+### Cache scope
+
+Each image gets a scope of its own, `{image name}-{hash}`, for example:
+
+```text
+relybytes-public-website-06c7710e623e
+```
+
+The hash covers the repository, the registry, the image name, an explicit `suffix`, the Dockerfile path, the build context, the target and the platforms. That means:
+
+- **Two images never share a scope**, even in the same repository or the same job. A shared scope would make each export replace the cache index of the other image, and the next build would miss.
+- **The suffix derived from the branch is not part of the scope.** GitHub keeps cache entries per branch anyway, and BuildKit imports the index of the current branch and also of the base and the default branch. A pull request or a new branch therefore starts from the cache of `main` instead of from nothing, and never overwrites it.
+- **An explicit `suffix` is part of the scope**, because two variants of one image built from the same branch would otherwise overwrite each other.
+
+Set `cache_scope` to choose the scope yourself: to share one cache between two image names built from the same Dockerfile, or to keep apart two builds of the same image that differ only in `build_args`. The value is used as given, except that anything other than letters, digits, `.`, `_` and `-` becomes `-`.
+
+### When the cache still cannot help
+
+In each of these cases the build runs cold, or partly cold, and still succeeds:
+
+- **The runner provides no cache service**, for example GitHub Enterprise Server with the Actions cache turned off, or a local runner such as `act`. The action says so in a notice that starts with *Build cache is unavailable*.
+- **The builder cannot reach the service.** BuildKit talks to `results-receiver.actions.githubusercontent.com` and to the cache storage on `*.blob.core.windows.net` from inside the builder container. A self-hosted runner behind a firewall must allow both. A firewall that silently drops the traffic makes the build wait for the cache timeout first, so set `cache: "false"` on such a runner.
+- **The job may only read the cache.** Runs of events that someone without write access can trigger, such as `pull_request_target` or `issue_comment`, get read-only access to the cache of the default branch, and `cache-mode: read` does the same on purpose. The cache is imported, nothing new is exported.
+- **The cache was evicted.** A repository holds 10 GB of cache by default. Entries not used for 7 days are deleted, and when the limit is reached the least recently used go first. `mode=max` stores every intermediate layer, so a large multi-stage image fills it quickly.
+- **There is nothing to start from.** The first build on the default branch is cold, and a branch never reads the cache of a sibling branch or of another tag.
+- **A build arg changes on every run**, such as a token, a timestamp or the commit SHA. Every Dockerfile step after the `ARG` that declares it gets a new cache key and rebuilds. Declare such an `ARG` as late as possible in the Dockerfile.
+- **The service throttles the export.** A repository can create up to 200 cache entries a minute and each exported layer is one entry. An export cut short is logged and ignored.
 
 ## Usage
 
@@ -234,8 +282,9 @@ Boolean inputs accept only `true` or `false`, case-insensitively and ignoring su
 | `push_on_pr`      | no       | `false`                        | Allow pushing images on pull request events. `true` or `false`                                                           |
 | `additional_tags` | no       | empty                          | Comma-separated additional tags on the suffixed image repository                                                         |
 | `latest`          | no       | `auto`                         | `true`, `false`, or `auto`. `auto` enables `:latest` only on `main` or `master` non-PR builds                            |
-| `cache`           | no       | `true`                         | Import and export the GitHub Actions build cache when the cache service is reachable. `true` or `false`                  |
+| `cache`           | no       | `true`                         | Import and export the GitHub Actions build cache. `true` or `false`. See [Build cache](#build-cache)                     |
 | `no_cache`        | no       | `false`                        | Disable the build cache entirely. `true` or `false`                                                                      |
+| `cache_scope`     | no       | One per image                  | Scope of the GitHub Actions build cache. See [Cache scope](#cache-scope)                                                 |
 | `load`            | no       | `auto`                         | Load the image into the local Docker daemon when it is not pushed. `auto`, `true`, or `false`. See [Build without push](#build-without-push) |
 | `setup_qemu`      | no       | `false`                        | Register QEMU binfmt handlers for this job. `true` or `false`. Off by default because binfmt is host-wide state          |
 
@@ -503,12 +552,14 @@ A persistent self-hosted runner can run jobs from several repositories at the sa
 - The registry password is masked by the action itself, so it is redacted in the log even when the caller computed it in a previous step, which is how AWS ECR login tokens are usually obtained. It is handed to `docker login` on stdin, never as an argument.
 - **Build arg values never appear on a command line.** They are exported into the step environment and only the key is passed as `--build-arg KEY`, because the process table is readable by every other job on a shared runner.
 - **Build args are not a place for secrets.** Their values are recorded in the image configuration and can be read back from the pushed image by anyone who can pull it. Use BuildKit secret mounts in your Dockerfile for real secrets.
+- **The cache token stays inside the action.** `ACTIONS_RUNTIME_TOKEN` goes from the step that reads it to the build step as a step output. It never enters the job environment, never reaches a command line and is never printed. See [Build cache](#build-cache).
+- **Every third-party action this action runs is pinned to a full commit SHA**, so a moved tag cannot change what runs with your registry credentials.
 - Prefer pull-only or push-only robot accounts when your registry supports them.
 - Pull request events do not push images by default. Use `push_on_pr: "true"` only when you fully trust the workflow context.
 
 ### Residual risk this action cannot remove
 
-On a self-hosted runner where all jobs run as the same operating system user and share one Docker daemon, concurrent jobs can read each other's process environment and each other's images, and any job can talk to the daemon as root-equivalent. The per-run `DOCKER_CONFIG` narrows the window, but it cannot create isolation the machine does not have. If your jobs handle credentials of different trust levels, use ephemeral runners or one runner per repository; that is the only place where this can actually be fixed.
+On a self-hosted runner where all jobs run as the same operating system user and share one Docker daemon, concurrent jobs can read each other's process environment and each other's images, and any job can talk to the daemon as root-equivalent. The process environment includes build arg values and, while the build step runs, the token for the Actions cache. The per-run `DOCKER_CONFIG` narrows the window, but it cannot create isolation the machine does not have. If your jobs handle credentials of different trust levels, use ephemeral runners or one runner per repository; that is the only place where this can actually be fixed.
 
 ## Notes
 
@@ -533,6 +584,8 @@ python scripts/lint-steps.py action.yml --shell-file scripts/lib.sh
 ```
 
 `scripts/lint-steps.py` loads `action.yml`, extracts each composite step's `run` body, replaces `${{ ... }}` expressions with a harmless placeholder, and runs `shellcheck` over the result. `scripts/lib.sh` holds every helper used by more than one step, so the sanitizers exist in exactly one place.
+
+CI also checks that every action is pinned to a full commit SHA, and builds a small image twice on a hosted runner to prove that the second build comes from the GitHub Actions cache, once with the buildx of the runner image and once with buildx 0.12.1. See [CI and release](docs/ci-and-release.md).
 
 Releases are tagged `vX.Y.Z`; a workflow then moves the `vX` and `vX.Y` alias tags to that commit.
 

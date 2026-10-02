@@ -16,7 +16,8 @@ Three consequences run through the whole file:
    Docker configuration directory and the buildx builder are therefore unique
    per run, under `$RUNNER_TEMP`.
 2. Anything on a command line is readable by any other job with `ps`. Secrets go
-   in on stdin, build arg values go in through the environment.
+   in on stdin, build arg values and the cache token go in through the
+   environment of the one step that needs them.
 3. Cleanup may only remove what this run created, must be safe to run twice, and
    must be safe when the step that created the thing never ran.
 
@@ -34,7 +35,8 @@ so nothing may need `sudo` and nothing may write to a machine-wide location.
 | Set up Docker Buildx         | `buildx`   | Creates the builder for this run; its `name` output is what every later buildx call uses                        |
 | Verify builder platforms     | `builder`  | Bootstraps the builder and compares the requested platforms with what it advertises                             |
 | Login to registry            |            | Only when pushing. Writes into the per-run `DOCKER_CONFIG`                                                       |
-| Build and push               | `build`    | Assembles the buildx command, exports build arg values, applies cache flags, reads the digest                    |
+| Read the Actions cache service address | `runtime` | Only with the `gha` cache. `actions/github-script`: reads the cache service variables the runner gives to JavaScript actions only, and passes them to the build step as outputs. See [Build cache](build-cache.md) |
+| Build and push               | `build`    | Assembles the buildx command, exports build arg values, derives the cache scope and applies the cache flags, reads the digest |
 | Cleanup                      | `cleanup`  | `if: always()`. Removes the builder, then the configuration directory, then restores `DOCKER_CONFIG`             |
 
 Steps communicate through step outputs only. Every output is written with
@@ -49,6 +51,9 @@ runner reports that as an opaque "Unable to process file command".
   the current-builder marker from being shared.
 - `Verify builder platforms` must run after the builder exists, because the list
   of supported platforms comes from `docker buildx inspect --bootstrap`.
+- `runtime` runs right before `Build and push`, the only step that receives its
+  outputs. It is the one step besides the two docker actions that is not a shell
+  step, so `scripts/lint-steps.py` does not check it; the cache job in CI runs it.
 - `Cleanup` removes the builder itself rather than leaving it to the
   `setup-buildx-action` post hook, because the post hook runs after cleanup has
   already deleted the directory the builder is registered in and would leave a
@@ -80,6 +85,11 @@ drifted. One copy is the point of this file.
 | `assert_repository_name`    | Last-defence grammar check                                               |
 | `assert_no_registry_host`   | Reject an `image_name` that already carries a registry host              |
 | `sanitize_tag`              | A Docker tag, capped at 128 characters                                   |
+| `is_truthy`                 | Read a boolean the way Go's `strconv.ParseBool` does, as buildx does     |
+| `short_hash`                | The first characters of a SHA-256, for names that must stay short        |
+| `derive_cache_scope`        | The cache scope of one image build, see [Build cache](build-cache.md)    |
+| `sanitize_cache_scope`      | A cache scope chosen by the caller in `cache_scope`                      |
+| `gha_cache_endpoint`        | The address attributes of a `type=gha` cache entry, never the token      |
 
 **Every function writes diagnostics to stderr.** They are called inside command
 substitutions, where anything on stdout becomes the return value: an
