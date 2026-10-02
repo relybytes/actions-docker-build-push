@@ -97,6 +97,11 @@ inputs:
     required: false
     default: "false"
 
+  cache_scope:
+    description: "Scope of the GitHub Actions build cache. Empty, the default, derives one per image from the repository, registry, image name, explicit suffix, Dockerfile, context, target and platforms, so two images never overwrite each other's cache. Set it to share one cache between images, or to keep apart two builds of one image that differ only in build args."
+    required: false
+    default: ""
+
   load:
     description: "Load the built image into the local Docker daemon when it is not pushed. 'auto' keeps the historical behaviour and loads single-platform builds only, 'false' never loads, 'true' always loads and is refused for multi-platform builds."
     required: false
@@ -234,6 +239,7 @@ runs:
         INPUT_PUSH_ON_PR: ${{ inputs.push_on_pr }}
         INPUT_CACHE: ${{ inputs.cache }}
         INPUT_NO_CACHE: ${{ inputs.no_cache }}
+        INPUT_CACHE_SCOPE: ${{ inputs.cache_scope }}
         INPUT_LOAD: ${{ inputs.load }}
         REGISTRY: ${{ inputs.registry }}
         REPO: ${{ github.repository }}
@@ -269,6 +275,11 @@ runs:
         GHA_CACHE="false"
         if [[ "$CACHE_ENABLED" == "true" && "$NO_CACHE" != "true" ]]; then
           GHA_CACHE="true"
+        fi
+
+        CACHE_SCOPE=""
+        if [[ -n "$(trim "$INPUT_CACHE_SCOPE")" ]]; then
+          CACHE_SCOPE="$(sanitize_cache_scope "$INPUT_CACHE_SCOPE")"
         fi
 
         IS_PULL_REQUEST="false"
@@ -415,6 +426,7 @@ runs:
         set_output "cache" "$CACHE_ENABLED"
         set_output "no_cache" "$NO_CACHE"
         set_output "gha_cache" "$GHA_CACHE"
+        set_output "cache_scope" "$CACHE_SCOPE"
         set_output "load_mode" "$LOAD_MODE"
 
         echo "::endgroup::"
@@ -660,6 +672,11 @@ runs:
         ADDITIONAL_TAGS: ${{ inputs.additional_tags }}
         SERVER_URL: ${{ github.server_url }}
         REPO: ${{ github.repository }}
+        REGISTRY: ${{ inputs.registry }}
+        BASE_NAME: ${{ steps.resolve.outputs.base_name }}
+        SUFFIX_INPUT: ${{ inputs.suffix }}
+        PLATFORM_LIST: ${{ steps.validate.outputs.platform_list }}
+        CACHE_SCOPE_INPUT: ${{ steps.resolve.outputs.cache_scope }}
         # From the 'runtime' step, empty when it was skipped or failed. The
         # token is masked by the runner, which registers it as a secret.
         ACTIONS_RUNTIME_TOKEN: ${{ steps.runtime.outputs.token }}
@@ -805,7 +822,12 @@ runs:
         elif [[ "$CACHE" != "true" ]]; then
           echo "Cache:           disabled by cache=false"
         else
-          CACHE_SCOPE="$(printf '%s' "$IMAGE_NAME" | tr '/' '-')"
+          if [[ -n "$CACHE_SCOPE_INPUT" ]]; then
+            CACHE_SCOPE="$CACHE_SCOPE_INPUT"
+          else
+            CACHE_SCOPE="$(derive_cache_scope "$REPO" "$REGISTRY" "$BASE_NAME" "$SUFFIX_INPUT" \
+              "$DOCKERFILE_PATH" "$BUILD_CONTEXT" "$BUILD_TARGET" "$PLATFORM_LIST")"
+          fi
 
           # Where the cache service is and which protocol it speaks, as cache
           # attributes. The token is not among them: buildx reads it from

@@ -250,6 +250,117 @@ is_truthy() {
   esac
 }
 
+# Print a short hexadecimal digest of a value, for names that must stay short
+# and still tell different values apart.
+# Usage: short_hash VALUE [LENGTH]
+short_hash() {
+  local value="$1"
+  local length="${2:-12}"
+  local digest
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    digest="$(printf '%s' "$value" | sha256sum)"
+  elif command -v shasum >/dev/null 2>&1; then
+    digest="$(printf '%s' "$value" | shasum -a 256)"
+  else
+    # Last resort on a machine with neither. A CRC is enough to tell names
+    # apart, which is all this is used for.
+    digest="$(printf '%s' "$value" | cksum)"
+    digest="$(printf '%08x' "${digest%% *}")"
+  fi
+
+  digest="${digest%% *}"
+  printf '%s' "${digest:0:length}"
+}
+
+# Derive the GitHub Actions cache scope of one image build.
+#
+# Usage: derive_cache_scope REPOSITORY REGISTRY BASE_NAME SUFFIX_INPUT \
+#          DOCKERFILE CONTEXT TARGET PLATFORMS
+#
+# The result is "{readable}-{hash}". The readable part is the image name, plus
+# the suffix when the caller chose one. The hash covers everything that makes
+# two builds different images. Two images sharing a scope replace each other's
+# cache index on every export, so each build finds the other image's index and
+# misses.
+#
+# A suffix derived from the branch is left out on purpose. BuildKit already
+# keeps one index per GitHub ref, and on import it also reads the index of the
+# base and the default branch, so leaving it out lets a pull request or a new
+# branch start from the default branch's cache instead of from nothing. An
+# explicit suffix stays in: two variants of one image built from the same branch
+# would otherwise overwrite each other.
+derive_cache_scope() {
+  # Named unlike the step variables that carry the same values: the linter
+  # would otherwise read those as misspellings of these.
+  local repo_slug="$1"
+  local registry_host="$2"
+  local image_base="$3"
+  local suffix_raw="$4"
+  local dockerfile="$5"
+  local context="$6"
+  local target="$7"
+  local platform_set="$8"
+  local suffix_value
+  local readable
+  local identity
+
+  suffix_value="$(normalize "$suffix_raw")"
+  registry_host="$(normalize "$registry_host")"
+  registry_host="${registry_host%/}"
+
+  # The same platforms in another order or spacing are the same build.
+  platform_set="$(printf '%s' "$platform_set" \
+    | tr ',' '\n' \
+    | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; /^$/d' \
+    | LC_ALL=C sort -u \
+    | tr '\n' ',')"
+  platform_set="${platform_set%,}"
+
+  readable="$(printf '%s' "$image_base" | tr '/' '-')"
+  if [[ -n "$suffix_value" && "$suffix_value" != "none" ]]; then
+    readable="${readable}-$(sanitize_name_component "$suffix_value")"
+  fi
+
+  # The scope ends up inside a cache key, which the cache service caps at 512
+  # characters, so the readable part stays short. The hash keeps it unique.
+  readable="${readable:0:100}"
+  readable="$(printf '%s' "$readable" | sed -E 's/[._-]+$//')"
+
+  identity="$(printf '%s\n' \
+    "repository=${repo_slug}" \
+    "registry=${registry_host}" \
+    "image=${image_base}" \
+    "suffix=${suffix_value}" \
+    "dockerfile=${dockerfile}" \
+    "context=${context}" \
+    "target=${target}" \
+    "platforms=${platform_set}")"
+
+  printf '%s-%s' "${readable:-image}" "$(short_hash "$identity")"
+}
+
+# Sanitize a cache scope chosen by the caller. It ends up inside the
+# comma-separated value of --cache-to and inside a cache key, so only a
+# conservative alphabet survives and anything else becomes '-'.
+sanitize_cache_scope() {
+  local scope
+
+  scope="$(printf '%s' "$(trim "$1")" \
+    | LC_ALL=C tr -c 'A-Za-z0-9._-' '-' \
+    | sed -E 's/-{2,}/-/g; s/^[._-]+//; s/[._-]+$//')"
+
+  scope="${scope:0:200}"
+  scope="$(printf '%s' "$scope" | sed -E 's/[._-]+$//')"
+
+  if [[ -z "$scope" ]]; then
+    printf '::error::Input cache_scope "%s" is empty after sanitization. Use letters, digits, dots, dashes and underscores.\n' "$1" >&2
+    return 1
+  fi
+
+  printf '%s' "$scope"
+}
+
 # Print the endpoint attributes of a type=gha cache entry, or nothing when no
 # address of the GitHub Actions cache service is available.
 #
