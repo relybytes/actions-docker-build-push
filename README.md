@@ -187,6 +187,8 @@ In each of these cases the build runs cold, or partly cold, and still succeeds:
 - **A build arg changes on every run**, such as a token, a timestamp or the commit SHA. Every Dockerfile step after the `ARG` that declares it gets a new cache key and rebuilds. Declare such an `ARG` as late as possible in the Dockerfile.
 - **The service throttles the export.** A repository can create up to 200 cache entries a minute and each exported layer is one entry. An export cut short is logged and ignored.
 
+The cache can also work and still not pay off. With `mode=max` every new layer is compressed and uploaded on every build, including the layers of build stages that never reach the image. A stage that writes gigabytes on every commit, such as a site build that prerenders thousands of pages, can cost more to export than the cache saves on the steps before it. Compare the duration of the build step over two or three builds with the cache, and set `cache: "false"` where the export does not pay for itself.
+
 ## Usage
 
 ### Default, push to GHCR for the current repository
