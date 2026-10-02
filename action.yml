@@ -88,7 +88,7 @@ inputs:
     default: "auto"
 
   cache:
-    description: "Import and export the GitHub Actions build cache when the Actions cache service is reachable. Must be 'true' or 'false'."
+    description: "Import and export the GitHub Actions build cache. The action reads the cache service address from the runner itself; the cache is skipped, with a notice, where the runner provides none. Must be 'true' or 'false'."
     required: false
     default: "true"
 
@@ -263,6 +263,14 @@ runs:
         LATEST_MODE="$(require_enum "latest" "$INPUT_LATEST" "true" "false" "auto")"
         LOAD_MODE="$(require_enum "load" "$INPUT_LOAD" "true" "false" "auto")"
 
+        # The GitHub Actions cache backend is in use unless either switch turns
+        # it off. Decided once here, because it also gates the step that reads
+        # the cache service address from the runner.
+        GHA_CACHE="false"
+        if [[ "$CACHE_ENABLED" == "true" && "$NO_CACHE" != "true" ]]; then
+          GHA_CACHE="true"
+        fi
+
         IS_PULL_REQUEST="false"
         if [[ "$EVENT_NAME" == "pull_request" || "$EVENT_NAME" == "pull_request_target" ]]; then
           IS_PULL_REQUEST="true"
@@ -406,6 +414,7 @@ runs:
         set_output "push" "$EFFECTIVE_PUSH"
         set_output "cache" "$CACHE_ENABLED"
         set_output "no_cache" "$NO_CACHE"
+        set_output "gha_cache" "$GHA_CACHE"
         set_output "load_mode" "$LOAD_MODE"
 
         echo "::endgroup::"
@@ -491,13 +500,13 @@ runs:
 
     - name: Set up QEMU
       if: inputs.setup_qemu == 'true'
-      uses: docker/setup-qemu-action@v4
+      uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       with:
         platforms: ${{ inputs.platforms }}
 
     - name: Set up Docker Buildx
       id: buildx
-      uses: docker/setup-buildx-action@v4
+      uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
     - name: Verify builder platforms
       id: builder
@@ -593,6 +602,38 @@ runs:
 
         echo "::endgroup::"
 
+    # The runner hands the address of the GitHub Actions cache service, and the
+    # job token for it, to JavaScript actions only: the shell steps of a
+    # composite action never see them, which is why every build used to run
+    # cold. This step reads them and passes them to the build step as step
+    # outputs, so they reach that one step and never enter the job environment.
+    # It prints variable names only, never a value.
+    - name: Read the Actions cache service address
+      id: runtime
+      if: steps.resolve.outputs.gha_cache == 'true'
+      # A cache problem never fails a build. If this step fails, the build step
+      # finds no address, says so in a notice and builds cold.
+      continue-on-error: true
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      with:
+        script: |
+          const variables = {
+            token: 'ACTIONS_RUNTIME_TOKEN',
+            results_url: 'ACTIONS_RESULTS_URL',
+            cache_url: 'ACTIONS_CACHE_URL',
+            service_v2: 'ACTIONS_CACHE_SERVICE_V2',
+            cache_mode: 'ACTIONS_CACHE_MODE',
+          };
+          const provided = [];
+          for (const [output, name] of Object.entries(variables)) {
+            const value = process.env[name] ?? '';
+            core.setOutput(output, value);
+            if (value !== '') {
+              provided.push(name);
+            }
+          }
+          core.info(`Provided by the runner: ${provided.length > 0 ? provided.join(', ') : 'none'}`);
+
     - name: Build and push
       id: build
       shell: bash
@@ -619,6 +660,13 @@ runs:
         ADDITIONAL_TAGS: ${{ inputs.additional_tags }}
         SERVER_URL: ${{ github.server_url }}
         REPO: ${{ github.repository }}
+        # From the 'runtime' step, empty when it was skipped or failed. The
+        # token is masked by the runner, which registers it as a secret.
+        ACTIONS_RUNTIME_TOKEN: ${{ steps.runtime.outputs.token }}
+        ACTIONS_RESULTS_URL: ${{ steps.runtime.outputs.results_url }}
+        ACTIONS_CACHE_URL: ${{ steps.runtime.outputs.cache_url }}
+        ACTIONS_CACHE_SERVICE_V2: ${{ steps.runtime.outputs.service_v2 }}
+        ACTIONS_CACHE_MODE: ${{ steps.runtime.outputs.cache_mode }}
       run: |
         set -euo pipefail
 
@@ -738,28 +786,61 @@ runs:
           BUILD_CMD+=(--target "$BUILD_TARGET")
         fi
 
-        # Real cache import and export, through the GitHub Actions cache service.
-        # The old BUILDKIT_INLINE_CACHE build arg exported an inline cache that
-        # nothing ever imported, because there was no --cache-from anywhere in
-        # the action: every build was cold while the input defaulted to on.
-        CACHE_SCOPE="$(printf '%s' "$IMAGE_NAME" | tr '/' '-')"
+        # Real cache import and export, through the GitHub Actions cache
+        # service. The runner hands its address and the job token to JavaScript
+        # actions only, so the 'runtime' step reads them and they arrive here
+        # as step outputs: in this step's environment and nowhere else.
+        #
+        # An empty value means 'not provided'. Unset it, because buildx tells an
+        # empty variable apart from a missing one.
+        for runtime_var in ACTIONS_RUNTIME_TOKEN ACTIONS_RESULTS_URL ACTIONS_CACHE_URL ACTIONS_CACHE_SERVICE_V2 ACTIONS_CACHE_MODE; do
+          if [[ -z "${!runtime_var:-}" ]]; then
+            unset "$runtime_var"
+          fi
+        done
 
         if [[ "$NO_CACHE" == "true" ]]; then
           BUILD_CMD+=(--no-cache)
           echo "Cache:           disabled by no_cache=true"
         elif [[ "$CACHE" != "true" ]]; then
           echo "Cache:           disabled by cache=false"
-        elif [[ -n "${ACTIONS_RUNTIME_TOKEN:-}" ]] &&
-          [[ -n "${ACTIONS_CACHE_URL:-}${ACTIONS_RESULTS_URL:-}" ]]; then
-          # ignore-error keeps a cache export failure from failing the build.
-          BUILD_CMD+=(
-            --cache-from "type=gha,scope=${CACHE_SCOPE}"
-            --cache-to "type=gha,mode=max,ignore-error=true,scope=${CACHE_SCOPE}"
-          )
-          echo "Cache:           GitHub Actions cache, scope ${CACHE_SCOPE}"
         else
-          echo "::notice::Build cache is unavailable: the GitHub Actions cache service is not reachable from this step, because ACTIONS_RUNTIME_TOKEN and the cache URL are not exported to composite shell steps on every runner. Building cold. To enable the cache, export the Actions runtime variables into the job environment before this step."
-          echo "Cache:           unavailable, building cold"
+          CACHE_SCOPE="$(printf '%s' "$IMAGE_NAME" | tr '/' '-')"
+
+          # Where the cache service is and which protocol it speaks, as cache
+          # attributes. The token is not among them: buildx reads it from
+          # ACTIONS_RUNTIME_TOKEN in its own environment, never from argv.
+          GHA_ENDPOINT=""
+          if [[ -n "${ACTIONS_RUNTIME_TOKEN:-}" ]]; then
+            GHA_ENDPOINT="$(gha_cache_endpoint "${ACTIONS_RESULTS_URL:-}" "${ACTIONS_CACHE_URL:-}" "${ACTIONS_CACHE_SERVICE_V2:-}")"
+          fi
+
+          # The cache-mode of the job, which the cache service enforces anyway:
+          # read imports only, write-only exports only, none turns the cache off.
+          # Unset or unknown means both, as in the actions/cache toolkit.
+          CACHE_MODE="$(normalize "${ACTIONS_CACHE_MODE:-}")"
+
+          if [[ -z "$GHA_ENDPOINT" ]]; then
+            echo "::notice::Build cache is unavailable: the runner did not provide the GitHub Actions cache service to this action (ACTIONS_RUNTIME_TOKEN together with ACTIONS_RESULTS_URL or ACTIONS_CACHE_URL), so the build runs cold. This happens where there is no cache service, for example GitHub Enterprise Server with the Actions cache turned off or a local runner such as act, or when the step that reads these variables failed. See 'Build cache' in the README of relybytes/actions-docker-build-push."
+            echo "Cache:           unavailable, building cold"
+          elif [[ "$CACHE_MODE" == "none" ]]; then
+            echo "Cache:           disabled by cache-mode none"
+          else
+            CACHE_NOTE=""
+            if [[ "$CACHE_MODE" == "write-only" ]]; then
+              CACHE_NOTE=", export only (cache-mode write-only)"
+            else
+              BUILD_CMD+=(--cache-from "type=gha,scope=${CACHE_SCOPE},${GHA_ENDPOINT}")
+            fi
+            if [[ "$CACHE_MODE" == "read" ]]; then
+              CACHE_NOTE=", import only (cache-mode read)"
+            else
+              # ignore-error keeps a cache export failure from failing the build.
+              BUILD_CMD+=(--cache-to "type=gha,mode=max,ignore-error=true,scope=${CACHE_SCOPE},${GHA_ENDPOINT}")
+            fi
+            echo "Cache:           GitHub Actions cache, scope ${CACHE_SCOPE}${CACHE_NOTE}"
+            echo "Cache service:   ${GHA_ENDPOINT}"
+          fi
         fi
 
         if [[ "$PUSH" == "true" ]]; then

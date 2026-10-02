@@ -236,3 +236,62 @@ sanitize_tag() {
 
   printf '%s' "$tag"
 }
+
+# Read a value as a boolean the way Go's strconv.ParseBool does, which is how
+# buildx reads ACTIONS_CACHE_SERVICE_V2. The runner sets that one to "True".
+is_truthy() {
+  case "$(normalize "$1")" in
+    1 | t | true)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# Print the endpoint attributes of a type=gha cache entry, or nothing when no
+# address of the GitHub Actions cache service is available.
+#
+# Usage: gha_cache_endpoint RESULTS_URL CACHE_URL SERVICE_V2
+#
+# The token is not an argument on purpose: buildx reads ACTIONS_RUNTIME_TOKEN
+# from its own environment, so the token never reaches a command line.
+#
+# The address is spelled out instead of being left to buildx, because buildx
+# older than 0.21 reads ACTIONS_CACHE_URL only, knows nothing about cache
+# service v2, which is the only one github.com still runs, and silently drops a
+# gha cache entry that ends up without a url. BuildKit, which the builder
+# container runs in its current version, speaks v2 as soon as it gets url_v2.
+gha_cache_endpoint() {
+  local results_url="$1"
+  local cache_url="$2"
+  local service_v2="$3"
+  local plain_url='^https?://[^[:space:],"]+$'
+  local url
+  local attributes
+
+  if is_truthy "$service_v2" && [[ -n "$results_url" ]]; then
+    url="$results_url"
+    # 'url' as well as 'url_v2': buildx older than 0.21 drops the entry
+    # when 'url' is missing, and BuildKit prefers 'url_v2' when both are set.
+    attributes="version=2,url=${url},url_v2=${url}"
+  elif [[ -n "$cache_url" ]]; then
+    url="$cache_url"
+    attributes="url=${url}"
+  elif [[ -n "$results_url" ]]; then
+    url="$results_url"
+    attributes="url=${url}"
+  else
+    return 0
+  fi
+
+  # The attributes travel inside a comma-separated value, so an address with
+  # a comma, a quote or whitespace in it would corrupt the whole entry.
+  if [[ ! "$url" =~ $plain_url ]]; then
+    printf '::warning::Not using the Actions cache service address "%s": it is not a plain http(s) URL.\n' "$url" >&2
+    return 0
+  fi
+
+  printf '%s' "$attributes"
+}
